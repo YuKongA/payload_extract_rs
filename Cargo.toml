@@ -60,6 +60,7 @@ futures = { version = "0.3", default-features = false, features = ["std"], optio
 
 [build-dependencies]
 prost-build = "0.14"
+protoc-bin-vendored = "3"
 
 [features]
 default = ["http-native-tls"]
