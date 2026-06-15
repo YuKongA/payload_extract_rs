@@ -270,27 +270,12 @@ fn process_operation(
                 },
             )?;
         }
-        OpType::SourceBsdiff => {
-            // SOURCE_BSDIFF: BSDIFF40 format (bz2 compressed)
-            let src = source_data
-                .ok_or_else(|| anyhow::anyhow!("SOURCE_BSDIFF requires source partition data"))?;
-            let blob = get_blob(payload, task)?;
-            if config.verify_ops {
-                verify::verify_sha256(blob, &task.data_sha256)?;
-            }
-            bufpool::with_extent_buffer(
-                extents_byte_size(&task.src_extents, block_size) as usize,
-                |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf);
-                    let patched = apply_bsdiff(buf, blob, "source_bsdiff")?;
-                    write_to_extents(&patched, &task.dst_extents, writer, block_size)
-                },
-            )?;
-        }
-        OpType::BrotliBsdiff => {
-            // BROTLI_BSDIFF: BSDF2 format (brotli compressed streams)
-            let src = source_data
-                .ok_or_else(|| anyhow::anyhow!("BROTLI_BSDIFF requires source partition data"))?;
+        OpType::SourceBsdiff | OpType::BrotliBsdiff => {
+            // BSDIFF40 (bz2) / BSDF2 (brotli) are both magic-prefixed bsdiff
+            // patches; patch_bsdf2 auto-detects the format and compression.
+            let src = source_data.ok_or_else(|| {
+                anyhow::anyhow!("{:?} requires source partition data", task.op_type)
+            })?;
             let blob = get_blob(payload, task)?;
             if config.verify_ops {
                 verify::verify_sha256(blob, &task.data_sha256)?;
@@ -301,7 +286,7 @@ fn process_operation(
                     read_from_extents(src, &task.src_extents, block_size, buf);
                     let mut patched = Vec::new();
                     bsdiff_android::patch_bsdf2(buf, blob, &mut patched)
-                        .map_err(|e| anyhow::anyhow!("BROTLI_BSDIFF patch failed: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("{:?} patch failed: {e}", task.op_type))?;
                     write_to_extents(&patched, &task.dst_extents, writer, block_size)
                 },
             )?;
@@ -388,15 +373,6 @@ fn process_operation(
 #[inline]
 fn get_blob<'a>(payload: &'a PayloadView, task: &OperationTask) -> Result<&'a [u8]> {
     Ok(payload.blob_slice_raw(task.data_offset, task.data_length)?)
-}
-
-/// Apply a bsdiff patch to source data, producing new data.
-fn apply_bsdiff(old: &[u8], patch_data: &[u8], context: &str) -> Result<Vec<u8>> {
-    let mut patch_reader = std::io::Cursor::new(patch_data);
-    let mut new = Vec::new();
-    bsdiff_android::patch(old, &mut patch_reader, &mut new)
-        .map_err(|e| anyhow::anyhow!("{context} bsdiff patch failed: {e}"))?;
-    Ok(new)
 }
 
 /// Calculate the total byte size of extents.
