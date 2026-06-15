@@ -96,7 +96,7 @@ pub fn extract_partitions(
 
     // Configure rayon thread pool
     let thread_count = if config.threads == 0 {
-        num_cpus::get()
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     } else {
         config.threads
     };

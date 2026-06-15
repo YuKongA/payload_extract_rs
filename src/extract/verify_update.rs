@@ -330,7 +330,7 @@ pub fn verify_update_partitions(
     }
 
     let thread_count = if threads == 0 {
-        num_cpus::get()
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     } else {
         threads
     };
