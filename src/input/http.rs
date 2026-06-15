@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +41,7 @@ async fn range_download(
     url: &str,
     offset: u64,
     length: u64,
+    progress: Option<&AtomicU64>,
 ) -> Result<Vec<u8>> {
     use futures::StreamExt;
 
@@ -63,7 +65,18 @@ async fn range_download(
 
         let status = resp.status();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            return Ok(resp.bytes().await?.to_vec());
+            // Stream the body so callers tracking progress see bytes arrive
+            // incrementally rather than in a single jump once the range finishes.
+            let mut buf = Vec::with_capacity(length as usize);
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("stream error")?;
+                buf.extend_from_slice(&chunk);
+                if let Some(p) = progress {
+                    p.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+            }
+            return Ok(buf);
         }
 
         if status.is_success() {
@@ -85,11 +98,17 @@ async fn range_download(
                                 let take = remaining_chunk.len().min(to_read);
                                 buf.extend_from_slice(&remaining_chunk[..take]);
                                 to_read -= take;
+                                if let Some(p) = progress {
+                                    p.fetch_add(take as u64, Ordering::Relaxed);
+                                }
                             }
                         } else {
                             let take = chunk.len().min(to_read);
                             buf.extend_from_slice(&chunk[..take]);
                             to_read -= take;
+                            if let Some(p) = progress {
+                                p.fetch_add(take as u64, Ordering::Relaxed);
+                            }
                         }
                     }
                     Some(Err(e)) => return Err(e).context("stream error"),
@@ -128,7 +147,7 @@ async fn detect_payload_offset(client: &reqwest::Client, url: &str) -> Result<u6
     let cd = fetch_zip_cd(client, url, total_size).await?;
     let entry = find_cd_entry(&cd, "payload.bin").context("payload.bin not found in remote ZIP")?;
 
-    let lfh = range_download(client, url, entry.local_off, 30).await?;
+    let lfh = range_download(client, url, entry.local_off, 30, None).await?;
     let n = u16::from_le_bytes(lfh[26..28].try_into().unwrap()) as u64;
     let e = u16::from_le_bytes(lfh[28..30].try_into().unwrap()) as u64;
     Ok(entry.local_off + 30 + n + e)
@@ -145,7 +164,7 @@ pub fn open_http_metadata(
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
-        let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64).await?;
+        let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64, None).await?;
         let header = PayloadHeader::parse(&hdr)?;
 
         let meta_len =
@@ -155,7 +174,7 @@ pub fn open_http_metadata(
             style::label().apply_to("Fetching manifest"),
             style::format_size(header.manifest_size)
         );
-        let meta = range_download(&client, url, payload_off, meta_len).await?;
+        let meta = range_download(&client, url, payload_off, meta_len, None).await?;
 
         Ok(PayloadView::from_memory(meta, HashMap::new())?)
     })
@@ -173,7 +192,7 @@ pub fn open_http_extract(
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
-        let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64).await?;
+        let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64, None).await?;
         let header = PayloadHeader::parse(&hdr)?;
 
         let meta_len =
@@ -183,7 +202,7 @@ pub fn open_http_extract(
             style::label().apply_to("Fetching manifest"),
             style::format_size(header.manifest_size)
         );
-        let meta = range_download(&client, url, payload_off, meta_len).await?;
+        let meta = range_download(&client, url, payload_off, meta_len, None).await?;
 
         let manifest = DeltaArchiveManifest::decode(
             &meta[HEADER_SIZE..HEADER_SIZE + header.manifest_size as usize],
@@ -229,7 +248,6 @@ pub fn open_http_extract(
         );
 
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
 
         let client = Arc::new(client);
         let url: Arc<str> = Arc::from(url);
@@ -246,8 +264,9 @@ pub fn open_http_extract(
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                let data = range_download(&client, &url, remote_off, length).await?;
-                downloaded.fetch_add(data.len() as u64, Ordering::Relaxed);
+                let data =
+                    range_download(&client, &url, remote_off, length, Some(downloaded.as_ref()))
+                        .await?;
                 Ok::<_, anyhow::Error>((data_region_off, data))
             }));
         }
@@ -262,13 +281,27 @@ pub fn open_http_extract(
         );
         pb.set_prefix("Downloading");
 
+        // Drive the bar from the shared byte counter on a timer so it advances as
+        // bytes stream in. Updating only on per-range completion made a single
+        // merged range sit at 0% then jump straight to 100%.
+        let ticker = {
+            let pb = pb.clone();
+            let downloaded = downloaded.clone();
+            tokio::spawn(async move {
+                loop {
+                    pb.set_position(downloaded.load(Ordering::Relaxed));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+
         let mut range_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(merged.len());
         for handle in handles {
             let (off, data) = handle.await??;
-            let done = downloaded.load(Ordering::Relaxed);
-            pb.set_position(done);
             range_data.push((off, data));
         }
+        ticker.abort();
+        pb.set_position(downloaded.load(Ordering::Relaxed));
         pb.finish_and_clear();
 
         let mut buf = meta;
@@ -366,7 +399,7 @@ async fn fetch_total_size_and_head(client: &reqwest::Client, url: &str) -> Resul
     let head = if head.len() >= 4 {
         head
     } else {
-        range_download(client, url, 0, 4).await?
+        range_download(client, url, 0, 4, None).await?
     };
     Ok((total_size, head))
 }
@@ -375,7 +408,7 @@ async fn fetch_total_size_and_head(client: &reqwest::Client, url: &str) -> Resul
 async fn fetch_zip_cd(client: &reqwest::Client, url: &str, total_size: u64) -> Result<Vec<u8>> {
     let tail_size = (256 * 1024u64).min(total_size);
     let tail_offset = total_size - tail_size;
-    let tail = range_download(client, url, tail_offset, tail_size).await?;
+    let tail = range_download(client, url, tail_offset, tail_size, None).await?;
 
     let eocd_pos = tail
         .windows(4)
@@ -391,7 +424,7 @@ async fn fetch_zip_cd(client: &reqwest::Client, url: &str, total_size: u64) -> R
             let i = (z64_off - tail_offset) as usize;
             tail[i..i + 56].to_vec()
         } else {
-            range_download(client, url, z64_off, 56).await?
+            range_download(client, url, z64_off, 56, None).await?
         };
         (
             u64::from_le_bytes(rec[48..56].try_into().unwrap()),
@@ -409,7 +442,7 @@ async fn fetch_zip_cd(client: &reqwest::Client, url: &str, total_size: u64) -> R
         let i = (cd_offset - tail_offset) as usize;
         tail[i..i + cd_size as usize].to_vec()
     } else {
-        range_download(client, url, cd_offset, cd_size).await?
+        range_download(client, url, cd_offset, cd_size, None).await?
     };
     Ok(cd)
 }
@@ -480,7 +513,7 @@ async fn download_stored_zip_entry(
 
     const LFH_EXTRA_HEADROOM: u64 = 1024;
     let optimistic = 30 + entry.name_len as u64 + LFH_EXTRA_HEADROOM + entry.compressed_size;
-    let buf = range_download(client, url, entry.local_off, optimistic).await?;
+    let buf = range_download(client, url, entry.local_off, optimistic, None).await?;
     if buf.len() < 30 {
         bail!("LFH truncated for {target}");
     }
@@ -495,7 +528,7 @@ async fn download_stored_zip_entry(
 
     // LFH extra exceeded headroom — fall back to a second range request.
     let abs_data_off = entry.local_off + data_off as u64;
-    let data = range_download(client, url, abs_data_off, entry.compressed_size).await?;
+    let data = range_download(client, url, abs_data_off, entry.compressed_size, None).await?;
     Ok(Some(data))
 }
 
