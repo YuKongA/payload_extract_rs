@@ -18,6 +18,7 @@ pub struct MetadataArgs {
 #[derive(Serialize)]
 struct PayloadMetadata {
     version: u64,
+    minor_version: u32,
     manifest_size: u64,
     metadata_signature_size: u32,
     block_size: u32,
@@ -92,6 +93,7 @@ pub fn run(args: MetadataArgs, insecure: bool) -> Result<()> {
 
     let metadata = PayloadMetadata {
         version: header.version,
+        minor_version: manifest.minor_version.unwrap_or(0),
         manifest_size: header.manifest_size,
         metadata_signature_size: header.metadata_signature_size,
         block_size: payload.block_size(),
@@ -111,6 +113,11 @@ pub fn run(args: MetadataArgs, insecure: bool) -> Result<()> {
             "  {}                  {}",
             style::label().apply_to("Version:"),
             metadata.version
+        );
+        println!(
+            "  {}            {}",
+            style::label().apply_to("Minor version:"),
+            metadata.minor_version
         );
         println!(
             "  {}            {} bytes",
