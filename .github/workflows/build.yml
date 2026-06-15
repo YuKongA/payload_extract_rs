@@ -130,6 +130,8 @@ jobs:
 
   build-android:
     runs-on: ubuntu-latest
+    env:
+      ONDK_VERSION: r29.6
     strategy:
       matrix:
         target:
@@ -140,8 +142,24 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache ONDK
+        id: ondk-cache
+        uses: actions/cache@v5
         with:
-          targets: ${{ matrix.target }}
+          path: ${{ runner.temp }}/ondk
+          key: ondk-${{ env.ONDK_VERSION }}-linux
+
+      - name: Download ONDK
+        if: steps.ondk-cache.outputs.cache-hit != 'true'
+        run: |
+          url="https://github.com/topjohnwu/ondk/releases/download/${ONDK_VERSION}/ondk-${ONDK_VERSION}-linux.tar.xz"
+          mkdir -p "${{ runner.temp }}/ondk"
+          curl -fL "$url" -o "${{ runner.temp }}/ondk.tar.xz"
+          tar -C "${{ runner.temp }}/ondk" --strip-components=1 -xf "${{ runner.temp }}/ondk.tar.xz"
+
+      - name: Link ONDK Rust toolchain
+        run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
       - name: Cargo cache
         uses: actions/cache@v5
@@ -150,22 +168,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.target }}-cargo-
-
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r27c
+          key: ${{ matrix.target }}-ondk-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-ondk-cargo-
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - name: Build
         env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: cargo ndk --target ${{ matrix.target }} --platform 23 build --release --no-default-features --features http-vendored-tls
+          ANDROID_NDK_HOME: ${{ runner.temp }}/ondk
+          ANDROID_NDK_ROOT: ${{ runner.temp }}/ondk
+          RUSTC_BOOTSTRAP: "1"
+          RUSTFLAGS: "-Clinker-plugin-lto"
+          CFLAGS_aarch64-linux-android: "-flto"
+          CXXFLAGS_aarch64-linux-android: "-flto"
+          CFLAGS_x86_64-linux-android: "-flto"
+          CXXFLAGS_x86_64-linux-android: "-flto"
+        run: |
+          cargo +ondk ndk -t ${{ matrix.target }} --platform 23 build --release \
+            -Z build-std=std,panic_abort \
+            --no-default-features --features http-rustls
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

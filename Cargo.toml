@@ -58,7 +58,7 @@ serde_json = "1"
 
 # Async HTTP (feature-gated)
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = ["stream"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["stream"], optional = true }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [build-dependencies]
@@ -69,10 +69,9 @@ protoc-bin-vendored = "3"
 default = ["http-native-tls"]
 http = ["dep:tokio", "dep:reqwest", "dep:futures"]
 http-native-tls = ["http", "reqwest?/native-tls"]
-http-vendored-tls = ["http", "reqwest?/native-tls-vendored"]
+http-rustls = ["http", "reqwest?/rustls-tls-webpki-roots"]
 
 [profile.release]
-opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
