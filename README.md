@@ -103,7 +103,11 @@ payload-extract ota-metadata "https://example.com/ota.zip"
 #### Global options
 
 ```bash
-payload-extract -k extract "https://..."   # skip SSL verification
+# skip SSL verification
+payload-extract -k extract "https://..."
+
+# Override User-Agent
+payload-extract -A "CustomAgent/1.0" list "https://..."
 ```
 
 ### Supported platforms
@@ -220,7 +224,11 @@ payload-extract ota-metadata "https://example.com/ota.zip"
 #### 全局选项
 
 ```bash
-payload-extract -k extract "https://..."   # 跳过 SSL 证书验证
+# 跳过 SSL 证书验证
+payload-extract -k extract "https://..."
+
+# 覆盖 User-Agent
+payload-extract -A "CustomAgent/1.0" list "https://..."
 ```
 
 ### 支持平台

@@ -28,8 +28,8 @@ struct PartitionEntry {
     hash: Option<String>,
 }
 
-pub fn run(args: ListArgs, insecure: bool) -> Result<()> {
-    let payload = input::open(&args.input, insecure)?;
+pub fn run(args: ListArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
+    let payload = input::open(&args.input, insecure, user_agent)?;
     let partitions = payload.partitions();
 
     let entries: Vec<PartitionEntry> = partitions

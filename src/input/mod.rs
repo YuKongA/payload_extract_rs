@@ -16,13 +16,13 @@ pub(crate) const ZIP_MAGIC: &[u8; 4] = &[0x50, 0x4B, 0x03, 0x04];
 
 /// Open a payload from a file path or URL and return a PayloadView.
 /// For HTTP URLs, only downloads header + manifest (sufficient for list/metadata).
-pub fn open(input: &str, insecure: bool) -> Result<PayloadView> {
+pub fn open(input: &str, insecure: bool, user_agent: Option<&str>) -> Result<PayloadView> {
     #[cfg(feature = "http")]
     if input.starts_with("http://") || input.starts_with("https://") {
-        return http::open_http_metadata(input, insecure);
+        return http::open_http_metadata(input, insecure, user_agent);
     }
 
-    let _ = insecure;
+    let _ = (insecure, user_agent);
     open_local_file(input)
 }
 
@@ -33,25 +33,30 @@ pub fn open_for_extract(
     input: &str,
     partition_names: &[String],
     insecure: bool,
+    user_agent: Option<&str>,
 ) -> Result<PayloadView> {
     #[cfg(feature = "http")]
     if input.starts_with("http://") || input.starts_with("https://") {
-        return http::open_http_extract(input, partition_names, insecure);
+        return http::open_http_extract(input, partition_names, insecure, user_agent);
     }
 
-    let _ = (partition_names, insecure);
+    let _ = (partition_names, insecure, user_agent);
     open_local_file(input)
 }
 
 /// Read the OTA metadata files (META-INF/com/android/metadata and metadata.pb)
 /// from an OTA ZIP archive (local file or HTTP URL).
-pub fn read_ota_metadata(input: &str, insecure: bool) -> Result<OtaMetadataData> {
+pub fn read_ota_metadata(
+    input: &str,
+    insecure: bool,
+    user_agent: Option<&str>,
+) -> Result<OtaMetadataData> {
     #[cfg(feature = "http")]
     if input.starts_with("http://") || input.starts_with("https://") {
-        return http::read_ota_metadata_http(input, insecure);
+        return http::read_ota_metadata_http(input, insecure, user_agent);
     }
 
-    let _ = insecure;
+    let _ = (insecure, user_agent);
     let path = Path::new(input);
     let file = std::fs::File::open(path).with_context(|| format!("failed to open '{}'", input))?;
     let mmap =

@@ -52,7 +52,7 @@ pub struct ExtractArgs {
     pub verify_update: Option<Vec<String>>,
 }
 
-pub fn run(args: ExtractArgs, insecure: bool) -> Result<()> {
+pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
     let start = Instant::now();
 
     // Parse output config if provided
@@ -74,7 +74,8 @@ pub fn run(args: ExtractArgs, insecure: bool) -> Result<()> {
         style::log("Opening payload", &args.input);
     }
 
-    let payload = input::open_for_extract(&args.input, &pre_partition_names, insecure)?;
+    let payload =
+        input::open_for_extract(&args.input, &pre_partition_names, insecure, user_agent)?;
 
     if !args.quiet {
         let partitions = payload.partitions();

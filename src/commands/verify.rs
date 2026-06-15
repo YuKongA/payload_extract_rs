@@ -31,9 +31,9 @@ pub struct VerifyArgs {
     pub fec: bool,
 }
 
-pub fn run(args: VerifyArgs, insecure: bool) -> Result<()> {
+pub fn run(args: VerifyArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
     let start = Instant::now();
-    let payload = input::open(&args.input, insecure)?;
+    let payload = input::open(&args.input, insecure, user_agent)?;
     let block_size = payload.block_size();
 
     let partition_names = args.partitions.unwrap_or_default();

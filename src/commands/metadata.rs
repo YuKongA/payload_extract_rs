@@ -56,8 +56,8 @@ struct ApexEntry {
     decompressed_size: Option<i64>,
 }
 
-pub fn run(args: MetadataArgs, insecure: bool) -> Result<()> {
-    let payload = input::open(&args.input, insecure)?;
+pub fn run(args: MetadataArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
+    let payload = input::open(&args.input, insecure, user_agent)?;
     let header = payload.header();
     let manifest = payload.manifest();
 

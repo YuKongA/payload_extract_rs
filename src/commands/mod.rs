@@ -29,6 +29,10 @@ pub struct Cli {
     /// Skip SSL certificate verification for HTTPS URLs
     #[arg(short = 'k', long, global = true)]
     pub insecure: bool,
+
+    /// User-Agent header for HTTP requests (default: an Android OTA client UA)
+    #[arg(short = 'A', long, value_name = "UA", global = true)]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Subcommand)]

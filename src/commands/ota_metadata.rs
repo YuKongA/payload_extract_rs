@@ -15,8 +15,8 @@ pub struct OtaMetadataArgs {
     pub json: bool,
 }
 
-pub fn run(args: OtaMetadataArgs, insecure: bool) -> Result<()> {
-    let data = input::read_ota_metadata(&args.input, insecure)?;
+pub fn run(args: OtaMetadataArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
+    let data = input::read_ota_metadata(&args.input, insecure, user_agent)?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&data)?);

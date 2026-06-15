@@ -15,9 +15,14 @@ const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const ZIP_CD_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
 const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
 
-fn build_client(insecure: bool) -> Result<reqwest::Client> {
+/// Default User-Agent
+const DEFAULT_USER_AGENT: &str =
+    "Dalvik/2.1.0 (Linux; V; Android 16; Android Build/BP2A.250605.015)";
+
+fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
+        .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(4)
@@ -129,10 +134,14 @@ async fn detect_payload_offset(client: &reqwest::Client, url: &str) -> Result<u6
     Ok(entry.local_off + 30 + n + e)
 }
 
-pub fn open_http_metadata(url: &str, insecure: bool) -> Result<PayloadView> {
+pub fn open_http_metadata(
+    url: &str,
+    insecure: bool,
+    user_agent: Option<&str>,
+) -> Result<PayloadView> {
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(insecure)?;
+        let client = build_client(insecure, user_agent)?;
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
@@ -156,10 +165,11 @@ pub fn open_http_extract(
     url: &str,
     partition_names: &[String],
     insecure: bool,
+    user_agent: Option<&str>,
 ) -> Result<PayloadView> {
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(insecure)?;
+        let client = build_client(insecure, user_agent)?;
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
@@ -297,10 +307,14 @@ pub fn open_http_extract(
 
 /// Fetch META-INF/com/android/metadata and metadata.pb from a remote OTA ZIP.
 /// The two entries are downloaded concurrently after a single CD fetch.
-pub fn read_ota_metadata_http(url: &str, insecure: bool) -> Result<OtaMetadataData> {
+pub fn read_ota_metadata_http(
+    url: &str,
+    insecure: bool,
+    user_agent: Option<&str>,
+) -> Result<OtaMetadataData> {
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(insecure)?;
+        let client = build_client(insecure, user_agent)?;
         let (total_size, head) = fetch_total_size_and_head(&client, url).await?;
         if head.len() < 4 || &head[..4] != ZIP_MAGIC {
             bail!(
