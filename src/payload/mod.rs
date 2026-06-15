@@ -43,6 +43,10 @@ pub struct PayloadView {
     /// maps (original_data_region_offset, length) → position in backing data.
     /// When present, blob_slice_raw uses this instead of direct indexing.
     remap: Option<HashMap<u64, (u64, u64)>>, // orig_offset -> (compact_pos, length)
+    /// Owns resources released after `data` drops — e.g. the HTTP temp file,
+    /// deletable only once its mmap is unmapped (required on Windows). Declared
+    /// after `data` so it drops last; type-erased to avoid a `tempfile` dep here.
+    _guard: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl PayloadView {
@@ -60,6 +64,19 @@ impl PayloadView {
     ) -> Result<Self, PayloadError> {
         let data = PayloadData::Memory(buf);
         Self::from_data(data, 0, Some(remap))
+    }
+
+    /// Like [`from_memory`] but backed by an mmap'd compact temp file instead of
+    /// an in-memory buffer, keeping peak memory bounded for large HTTP downloads.
+    /// `guard` owns what must outlive the mmap (the temp file, deleted on drop).
+    pub fn from_mmap_compact(
+        mmap: Mmap,
+        remap: HashMap<u64, (u64, u64)>,
+        guard: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, PayloadError> {
+        let mut view = Self::from_data(PayloadData::Mmap(mmap), 0, Some(remap))?;
+        view._guard = Some(guard);
+        Ok(view)
     }
 
     fn from_data(
@@ -98,6 +115,7 @@ impl PayloadView {
             data_offset,
             payload_offset,
             remap,
+            _guard: None,
         })
     }
 
@@ -209,5 +227,58 @@ impl PayloadView {
         } else {
             None
         }
+    }
+}
+
+// tempfile is only available under the `http` feature.
+#[cfg(all(test, feature = "http"))]
+mod tests {
+    use super::*;
+    use crate::payload::header::MAGIC;
+    use std::io::Write;
+
+    /// Minimal valid payload metadata: 24-byte header (version 2, empty
+    /// manifest, no signature). `DeltaArchiveManifest::decode(&[])` yields a
+    /// default manifest, which is enough for `blob_slice_raw` (compact mode
+    /// reads via the remap, not the manifest).
+    fn minimal_meta() -> Vec<u8> {
+        let mut m = Vec::with_capacity(HEADER_SIZE);
+        m.extend_from_slice(MAGIC);
+        m.extend_from_slice(&2u64.to_be_bytes()); // version
+        m.extend_from_slice(&0u64.to_be_bytes()); // manifest_size
+        m.extend_from_slice(&0u32.to_be_bytes()); // metadata_signature_size
+        m
+    }
+
+    /// A compact temp file `[meta][blobA][blobB]` mmap'd via `from_mmap_compact`
+    /// must resolve each op's `data_offset` through the remap to the right bytes.
+    #[test]
+    fn from_mmap_compact_reads_remapped_ranges() {
+        let mut file_bytes = minimal_meta();
+        let blob_a = [0xAAu8; 16];
+        let blob_b = [0xBBu8; 32];
+
+        let pos_a = file_bytes.len() as u64;
+        file_bytes.extend_from_slice(&blob_a);
+        let pos_b = file_bytes.len() as u64;
+        file_bytes.extend_from_slice(&blob_b);
+
+        // Original payload data_offsets (arbitrary) → compact file positions.
+        let mut remap = HashMap::new();
+        remap.insert(1000u64, (pos_a, blob_a.len() as u64));
+        remap.insert(2000u64, (pos_b, blob_b.len() as u64));
+
+        let mut tf = tempfile::NamedTempFile::new().unwrap();
+        tf.write_all(&file_bytes).unwrap();
+        tf.flush().unwrap();
+        let mmap = unsafe { Mmap::map(tf.as_file()).unwrap() };
+
+        let view = PayloadView::from_mmap_compact(mmap, remap, Box::new(tf)).unwrap();
+
+        assert_eq!(view.blob_slice_raw(1000, 16).unwrap(), &blob_a);
+        assert_eq!(view.blob_slice_raw(2000, 32).unwrap(), &blob_b);
+        // Unknown offset that isn't in the remap falls through to direct
+        // indexing and should be out of bounds here.
+        assert!(view.blob_slice_raw(9999, 4).is_err());
     }
 }

@@ -74,8 +74,15 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         style::log("Opening payload", &args.input);
     }
 
-    let payload =
-        input::open_for_extract(&args.input, &pre_partition_names, insecure, user_agent)?;
+    // HTTP temp file goes in the output dir: avoids tmpfs (which would defeat
+    // the on-disk memory bound) and is guaranteed writable.
+    let open_opts = input::OpenOptions {
+        insecure,
+        user_agent: user_agent.map(str::to_owned),
+        download_progress: None,
+        temp_dir: Some(args.output.clone()),
+    };
+    let payload = input::open_for_extract_with(&args.input, &pre_partition_names, &open_opts)?;
 
     if !args.quiet {
         let partitions = payload.partitions();
@@ -103,6 +110,7 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         quiet: args.quiet,
         source_dir: args.source_dir,
         out_config,
+        progress: None,
     };
 
     extract::extract_partitions(&payload, &args.output, &partition_names, &config)?;

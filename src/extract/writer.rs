@@ -3,6 +3,35 @@ use std::path::Path;
 
 use crate::error::PayloadError;
 
+/// Write all of `data` at byte `offset` using positional I/O (pwrite /
+/// seek_write). Takes `&File`, so concurrent writers to non-overlapping
+/// regions need no shared cursor or lock. Shared by [`PartitionWriter`] and the
+/// HTTP compact temp-file downloader.
+#[inline]
+pub(crate) fn write_all_at(file: &File, data: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(data, offset)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0;
+        while written < data.len() {
+            let n = file.seek_write(&data[written..], offset + written as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "seek_write wrote 0 bytes",
+                ));
+            }
+            written += n;
+        }
+    }
+    Ok(())
+}
+
 /// Thread-safe partition writer using positional writes (pwrite/seek_write).
 ///
 /// Multiple threads can write to different offsets concurrently without
@@ -35,22 +64,7 @@ impl PartitionWriter {
     /// Write data at a specific byte offset. Thread-safe without mutex.
     #[inline]
     pub fn write_at(&self, data: &[u8], offset: u64) -> Result<(), PayloadError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file.write_all_at(data, offset)?;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            let mut written = 0;
-            while written < data.len() {
-                let n = self
-                    .file
-                    .seek_write(&data[written..], offset + written as u64)?;
-                written += n;
-            }
-        }
+        write_all_at(&self.file, data, offset)?;
         Ok(())
     }
 }

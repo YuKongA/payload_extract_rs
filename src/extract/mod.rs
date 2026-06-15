@@ -44,6 +44,12 @@ pub struct ExtractConfig {
     pub source_dir: Option<String>,
     /// Custom output paths per partition (from --out-config)
     pub out_config: Option<HashMap<String, PathBuf>>,
+    /// Invoked as each operation completes with `(completed_ops, total_ops)`.
+    /// Fires regardless of `quiet` (headless callers still want progress) and
+    /// runs on rayon workers, so it must be `Send + Sync`. Parallel
+    /// multi-partition extraction interleaves callbacks; single-partition (the
+    /// headless case) is monotonic.
+    pub progress: Option<crate::input::ProgressCallback>,
 }
 
 /// Extract selected partitions from a payload.
@@ -205,6 +211,7 @@ pub fn extract_partitions(
                 };
 
                 let completed = AtomicU64::new(0);
+                let total_ops = tasks.len() as u64;
 
                 // Execute operations in parallel via rayon
                 tasks.par_iter().try_for_each(|task| -> Result<()> {
@@ -220,6 +227,11 @@ pub fn extract_partitions(
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(pb) = &pb {
                         pb.set_position(done);
+                    }
+                    // Report progress regardless of `quiet` — headless callers
+                    // (GUI) set quiet=true but still consume the callback.
+                    if let Some(cb) = &config.progress {
+                        cb(done, total_ops);
                     }
 
                     Ok(())
