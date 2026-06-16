@@ -193,6 +193,7 @@ jobs:
         run: |
           cargo +ondk ndk -t ${{ matrix.target }} --platform 23 build --release \
             -Z build-std=std,panic_abort \
+            -Z build-std-features=optimize_for_size \
             --no-default-features --features http-rustls
 
       - name: Upload artifact
