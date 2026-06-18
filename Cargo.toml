@@ -2,7 +2,7 @@
 name = "payload-extract"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Android OTA payload.bin extractor"
 license = "GPL-2.0"
 keywords = ["android", "ota", "payload", "extraction"]

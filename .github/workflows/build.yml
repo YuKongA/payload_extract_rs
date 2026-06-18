@@ -135,7 +135,7 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     env:
-      ONDK_VERSION: r29.6
+      ONDK_VERSION: r30.0
     strategy:
       matrix:
         include:
