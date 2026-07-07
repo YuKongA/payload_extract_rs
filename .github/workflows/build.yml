@@ -53,6 +53,7 @@ jobs:
       - name: Build
         env:
           RUSTC_BOOTSTRAP: "1"
+        shell: bash
         run: |
           cargo build --release --target ${{ matrix.target }} \
             -Z build-std=std,panic_abort \
