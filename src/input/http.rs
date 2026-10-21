@@ -22,8 +22,15 @@ const DEFAULT_USER_AGENT: &str =
     "Dalvik/2.1.0 (Linux; V; Android 16; Android Build/BP2A.250605.015)";
 
 fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Client> {
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+
     #[allow(unused_mut)]
     let mut builder = reqwest::Client::builder()
+        .default_headers(default_headers)
         .danger_accept_invalid_certs(insecure)
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .timeout(Duration::from_secs(3600))
