@@ -166,10 +166,8 @@ jobs:
         include:
           - target: aarch64-linux-android
             name: payload-extract-android-aarch64
-            rustflags: "-Clinker-plugin-lto -C force-unwind-tables=no -C target-feature=-outline-atomics"
           - target: x86_64-linux-android
             name: payload-extract-android-x86_64
-            rustflags: "-Clinker-plugin-lto -C force-unwind-tables=no"
     steps:
       - uses: actions/checkout@v6
 
@@ -212,11 +210,9 @@ jobs:
           ANDROID_NDK_HOME: ${{ runner.temp }}/ondk
           ANDROID_NDK_ROOT: ${{ runner.temp }}/ondk
           RUSTC_BOOTSTRAP: "1"
-          RUSTFLAGS: ${{ matrix.rustflags }}
-          CFLAGS_aarch64-linux-android: "-flto -mno-outline-atomics"
-          CXXFLAGS_aarch64-linux-android: "-flto -mno-outline-atomics"
-          CFLAGS_aarch64_linux_android: "-flto -mno-outline-atomics"
-          CXXFLAGS_aarch64_linux_android: "-flto -mno-outline-atomics"
+          RUSTFLAGS: "-Clinker-plugin-lto -C force-unwind-tables=no"
+          CFLAGS_aarch64-linux-android: "-flto"
+          CXXFLAGS_aarch64-linux-android: "-flto"
           CFLAGS_x86_64-linux-android: "-flto"
           CXXFLAGS_x86_64-linux-android: "-flto"
         run: |
