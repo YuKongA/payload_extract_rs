@@ -40,6 +40,7 @@ fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Cli
 
     #[cfg(feature = "http-rustls")]
     {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
             .map(|cert| reqwest::tls::Certificate::from_der(cert.as_ref()))
