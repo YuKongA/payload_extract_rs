@@ -52,7 +52,10 @@ fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Cli
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Runtime::new().context("failed to create tokio runtime")
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")
 }
 
 /// Download a byte range fully into memory. Used for small reads (header,

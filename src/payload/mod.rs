@@ -13,6 +13,7 @@ pub use header::{HEADER_SIZE, PayloadHeader};
 /// Data backing for PayloadView — either mmap'd file or in-memory buffer.
 enum PayloadData {
     Mmap(Mmap),
+    #[cfg(feature = "http")]
     Memory(Vec<u8>),
 }
 
@@ -20,6 +21,7 @@ impl PayloadData {
     fn as_slice(&self) -> &[u8] {
         match self {
             PayloadData::Mmap(m) => m,
+            #[cfg(feature = "http")]
             PayloadData::Memory(v) => v,
         }
     }
@@ -58,6 +60,7 @@ impl PayloadView {
 
     /// Create a PayloadView from an in-memory buffer with offset remapping.
     /// Used for HTTP selective download where data is packed compactly.
+    #[cfg(feature = "http")]
     pub fn from_memory(
         buf: Vec<u8>,
         remap: HashMap<u64, (u64, u64)>,
@@ -69,6 +72,7 @@ impl PayloadView {
     /// Like [`from_memory`] but backed by an mmap'd compact temp file instead of
     /// an in-memory buffer, keeping peak memory bounded for large HTTP downloads.
     /// `guard` owns what must outlive the mmap (the temp file, deleted on drop).
+    #[cfg(feature = "http")]
     pub fn from_mmap_compact(
         mmap: Mmap,
         remap: HashMap<u64, (u64, u64)>,
@@ -104,6 +108,7 @@ impl PayloadView {
 
         // Advise the kernel about sequential access pattern for better readahead
         #[cfg(unix)]
+        #[allow(irrefutable_let_patterns)]
         if let PayloadData::Mmap(ref mmap) = data {
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }

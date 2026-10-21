@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4", default-features = false, features = ["derive", "color", "wrap_help", "std", "help", "usage", "error-context", "suggestions"] }
+clap = { version = "4", default-features = false, features = ["derive", "color", "std", "help", "usage"] }
 
 # Error handling
 thiserror = "2"
@@ -30,7 +30,7 @@ rayon = "1"
 memmap2 = "0.9"
 
 # Compression
-zstd = { version = "0.14", default-features = false }
+zstd = { version = "0.14", default-features = false, features = ["thin"] }
 xz2 = "0.1"
 bzip2 = "0.6"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc"] }
@@ -56,7 +56,7 @@ serde = { version = "1", default-features = false, features = ["derive", "std"] 
 serde_json = "1"
 
 # Async HTTP (feature-gated)
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["stream"], optional = true }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tempfile = { version = "3", optional = true }
@@ -73,8 +73,14 @@ http-native-tls = ["http", "reqwest?/native-tls"]
 http-rustls = ["http", "dep:webpki-root-certs", "reqwest?/rustls"]
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.lz4_flex]
+opt-level = 3

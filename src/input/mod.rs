@@ -25,15 +25,19 @@ pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 #[derive(Default, Clone)]
 pub struct OpenOptions {
     /// Skip TLS certificate verification for HTTPS URLs.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub insecure: bool,
     /// Override the HTTP `User-Agent` header.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub user_agent: Option<String>,
     /// Invoked ~10x/s during HTTP download with `(downloaded_bytes, total_bytes)`.
     /// Never fires for local files (no download phase).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub download_progress: Option<ProgressCallback>,
     /// Directory for the HTTP compact temp file (default: [`std::env::temp_dir`]).
     /// Set to the output dir to avoid tmpfs and guarantee a writable location
     /// (required on Android).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub temp_dir: Option<PathBuf>,
 }
 

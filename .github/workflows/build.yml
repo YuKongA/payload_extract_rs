@@ -210,7 +210,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ runner.temp }}/ondk
           ANDROID_NDK_ROOT: ${{ runner.temp }}/ondk
           RUSTC_BOOTSTRAP: "1"
-          RUSTFLAGS: "-Clinker-plugin-lto"
+          RUSTFLAGS: "-Clinker-plugin-lto -C force-unwind-tables=no -C link-arg=-Wl,--icf=all"
           CFLAGS_aarch64-linux-android: "-flto"
           CXXFLAGS_aarch64-linux-android: "-flto"
           CFLAGS_x86_64-linux-android: "-flto"
