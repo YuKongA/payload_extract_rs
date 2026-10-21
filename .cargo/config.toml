@@ -2,7 +2,7 @@
 rustflags = ["-C", "force-unwind-tables=no"]
 
 [target.'cfg(target_os = "android")']
-rustflags = ["-C", "force-unwind-tables=no", "-C", "link-arg=-Wl,--icf=all"]
+rustflags = ["-C", "force-unwind-tables=no"]
 
 [target.'cfg(target_os = "windows")']
 rustflags = ["-C", "link-arg=/OPT:ICF"]
