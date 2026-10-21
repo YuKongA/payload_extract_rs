@@ -30,7 +30,7 @@ rayon = "1"
 memmap2 = "0.9"
 
 # Compression
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 xz2 = "0.1"
 bzip2 = "0.6"
 lz4_flex = { version = "0.14", default-features = false, features = ["alloc"] }
@@ -42,7 +42,7 @@ bsdiff-android = "0.0.2"
 sha2 = { version = "0.11", default-features = false }
 
 # ZIP support
-zip = { version = "8", default-features = false }
+zip = { version = "9", default-features = false }
 
 # Progress
 indicatif = { version = "0.18", default-features = false, features = ["rayon"] }
@@ -57,9 +57,10 @@ serde_json = "1"
 
 # Async HTTP (feature-gated)
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["stream"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["stream"], optional = true }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tempfile = { version = "3", optional = true }
+webpki-root-certs = { version = "1", optional = true }
 
 [build-dependencies]
 prost-build = "0.14"
@@ -69,7 +70,7 @@ protoc-bin-vendored = "3"
 default = ["http-native-tls"]
 http = ["dep:tokio", "dep:reqwest", "dep:futures", "dep:tempfile"]
 http-native-tls = ["http", "reqwest?/native-tls"]
-http-rustls = ["http", "reqwest?/rustls-tls-webpki-roots"]
+http-rustls = ["http", "dep:webpki-root-certs", "reqwest?/rustls"]
 
 [profile.release]
 opt-level = "s"

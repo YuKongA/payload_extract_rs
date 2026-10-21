@@ -20,7 +20,7 @@ pub fn open_zip(mmap: Mmap) -> Result<PayloadView> {
         let mut found = None;
         for i in 0..archive.len() {
             let entry = archive.by_index_raw(i)?;
-            if entry.name() == "payload.bin" {
+            if entry.name().ok().as_deref() == Some("payload.bin") {
                 found = entry.data_start();
                 break;
             }
@@ -51,7 +51,11 @@ pub fn read_ota_metadata_from_mmap(mmap: &Mmap) -> Result<OtaMetadataData> {
         // borrow ends before we index into `mmap` for parsing.
         let (start, size, kind) = {
             let entry = archive.by_index_raw(i)?;
-            let kind = match entry.name() {
+            let name = match entry.name() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let kind = match name.as_ref() {
                 n if n == ota_metadata::text_entry_name() => Kind::Text,
                 n if n == ota_metadata::pb_entry_name() => Kind::Pb,
                 _ => continue,
@@ -59,7 +63,7 @@ pub fn read_ota_metadata_from_mmap(mmap: &Mmap) -> Result<OtaMetadataData> {
             if entry.compression() != zip::CompressionMethod::Stored {
                 bail!(
                     "{} entry is compressed (method {:?}); only STORED is supported",
-                    entry.name(),
+                    name,
                     entry.compression()
                 );
             }

@@ -22,15 +22,26 @@ const DEFAULT_USER_AGENT: &str =
     "Dalvik/2.1.0 (Linux; V; Android 16; Android Build/BP2A.250605.015)";
 
 fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    #[allow(unused_mut)]
+    let mut builder = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure)
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(4)
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .context("failed to build HTTP client")
+        .redirect(reqwest::redirect::Policy::limited(10));
+
+    #[cfg(feature = "http-rustls")]
+    {
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|cert| reqwest::tls::Certificate::from_der(cert.as_ref()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to parse webpki root certs")?;
+        builder = builder.tls_certs_only(roots);
+    }
+
+    builder.build().context("failed to build HTTP client")
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
