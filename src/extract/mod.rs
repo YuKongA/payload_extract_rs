@@ -7,8 +7,12 @@ pub mod verify;
 pub mod verify_update;
 pub mod writer;
 
+#[cfg(test)]
+mod file_output_tests;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +61,41 @@ pub fn extract_partitions(
     config: &ExtractConfig,
 ) -> Result<()> {
     let partitions = payload.selected_partitions(partition_names);
+    extract_selected(payload, &partitions, config, |part_name, part_size, block_size| {
+        let output_path = config.out_config.as_ref()
+            .and_then(|paths| paths.get(part_name))
+            .cloned()
+            .unwrap_or_else(|| output_dir.join(format!("{part_name}.img")));
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(PartitionWriter::new(&output_path, part_size, block_size)?)
+    })
+}
+
+/// Extract one partition into an already-open writable, seekable file.
+/// Existing contents are discarded and the file is resized to the partition.
+/// The caller retains ownership and its cursor; `out_config` does not apply.
+pub fn extract_partition_to_file(
+    payload: &PayloadView,
+    file: &File,
+    partition_name: &str,
+    config: &ExtractConfig,
+) -> Result<()> {
+    let partition = payload.partitions().iter()
+        .find(|partition| partition.partition_name == partition_name)
+        .with_context(|| format!("partition not found: {partition_name}"))?;
+    extract_selected(payload, &[partition], config, |_, part_size, block_size| {
+        Ok(PartitionWriter::from_file(file, part_size, block_size)?)
+    })
+}
+
+fn extract_selected(
+    payload: &PayloadView,
+    partitions: &[&crate::proto::PartitionUpdate],
+    config: &ExtractConfig,
+    make_writer: impl Fn(&str, u64, u32) -> Result<PartitionWriter> + Sync,
+) -> Result<()> {
     if partitions.is_empty() {
         bail!("no partitions selected for extraction");
     }
@@ -65,7 +104,6 @@ pub fn extract_partitions(
     if block_size == 0 || block_size > 16 * 1024 * 1024 {
         bail!("invalid block size: {block_size}");
     }
-    std::fs::create_dir_all(output_dir)?;
 
     // Check if any partition has delta operations
     let has_delta_ops = partitions.iter().any(|p| {
@@ -99,19 +137,6 @@ pub fn extract_partitions(
 
     let extract_partition = |partition: &&crate::proto::PartitionUpdate| -> Result<()> {
                 let part_name = &partition.partition_name;
-                let output_path = if let Some(ref out_config) = config.out_config {
-                    if let Some(custom_path) = out_config.get(part_name) {
-                        // Ensure parent directory exists for custom paths
-                        if let Some(parent) = custom_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        custom_path.clone()
-                    } else {
-                        output_dir.join(format!("{part_name}.img"))
-                    }
-                } else {
-                    output_dir.join(format!("{part_name}.img"))
-                };
 
                 // Determine partition size
                 let part_size = if let Some(size) = partition
@@ -135,8 +160,7 @@ pub fn extract_partitions(
                     })?
                 };
 
-                // Create pre-allocated output file
-                let writer = PartitionWriter::new(&output_path, part_size, block_size)?;
+                let writer = make_writer(part_name, part_size, block_size)?;
 
                 // Open source partition for delta OTA if needed
                 let source_file = if let Some(source_dir) = &config.source_dir {

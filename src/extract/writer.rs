@@ -18,6 +18,19 @@ impl PartitionWriter {
     /// Create a new partition writer with pre-allocated output file.
     pub fn new(path: &Path, total_size: u64, block_size: u32) -> Result<Self, PayloadError> {
         let file = File::create(path)?;
+        Self::from_owned_file(file, total_size, block_size)
+    }
+
+    /// Duplicate an already-open writable file without reopening its path.
+    /// The caller retains the original handle and its cursor.
+    pub fn from_file(file: &File, total_size: u64, block_size: u32) -> Result<Self, PayloadError> {
+        let file = file.try_clone()?;
+        // Reused documents must not retain stale bytes in ZERO/DISCARD or holes.
+        file.set_len(0)?;
+        Self::from_owned_file(file, total_size, block_size)
+    }
+
+    fn from_owned_file(file: File, total_size: u64, block_size: u32) -> Result<Self, PayloadError> {
         // Pre-allocate to avoid fragmentation and repeated metadata updates
         file.set_len(total_size)?;
         Ok(Self {
