@@ -1,13 +1,7 @@
 use clap::Parser;
 
 mod commands;
-mod error;
-mod extract;
-mod input;
-mod ota_metadata;
-mod payload;
-mod proto;
-mod style;
+use payload_extract::{extract, input, ota_metadata, payload, proto, storage, style};
 
 use commands::{Cli, Commands};
 

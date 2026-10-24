@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use prost::Message;
 
-use crate::extract::writer::write_all_at;
+use crate::storage::write_all_at;
 use crate::ota_metadata::{self, OtaMetadataData};
 use crate::payload::PayloadView;
 use crate::payload::header::{HEADER_SIZE, MAGIC, PayloadHeader};
@@ -13,6 +13,7 @@ use crate::proto::DeltaArchiveManifest;
 use crate::style;
 
 use super::ZIP_MAGIC;
+use super::ranges::plan_compact;
 const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const ZIP_CD_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
 const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
@@ -183,8 +184,9 @@ pub fn open_http_metadata(
         let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64).await?;
         let header = PayloadHeader::parse(&hdr)?;
 
-        let meta_len =
-            HEADER_SIZE as u64 + header.manifest_size + header.metadata_signature_size as u64;
+        let meta_len = (HEADER_SIZE as u64).checked_add(header.manifest_size)
+            .and_then(|length| length.checked_add(header.metadata_signature_size as u64))
+            .context("payload metadata length overflows")?;
         eprintln!(
             "{} ({})...",
             style::label().apply_to("Fetching manifest"),
@@ -212,8 +214,9 @@ pub fn open_http_extract(
         let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64).await?;
         let header = PayloadHeader::parse(&hdr)?;
 
-        let meta_len =
-            HEADER_SIZE as u64 + header.manifest_size + header.metadata_signature_size as u64;
+        let meta_len = (HEADER_SIZE as u64).checked_add(header.manifest_size)
+            .and_then(|length| length.checked_add(header.metadata_signature_size as u64))
+            .context("payload metadata length overflows")?;
         eprintln!(
             "{} ({})...",
             style::label().apply_to("Fetching manifest"),
@@ -224,7 +227,7 @@ pub fn open_http_extract(
         let manifest = DeltaArchiveManifest::decode(
             &meta[HEADER_SIZE..HEADER_SIZE + header.manifest_size as usize],
         )?;
-        let data_offset = header.data_offset();
+        let data_offset = meta_len;
 
         let parts: Vec<_> = if partition_names.is_empty() {
             manifest.partitions.iter().collect()
@@ -254,18 +257,14 @@ pub fn open_http_extract(
             return Ok(PayloadView::from_memory(meta, HashMap::new())?);
         }
 
-        op_ranges.sort_by_key(|r| r.0);
-        op_ranges.dedup();
-
-        let merged = merge_ranges(&op_ranges);
-        let total_data: u64 = merged.iter().map(|r| r.1).sum();
+        let plan = plan_compact(meta_len, op_ranges, None)?;
+        let total_data = plan.download_bytes;
         style::log(
             "Selective download",
-            format_args!("{} ({} range(s))", style::format_size(total_data), merged.len()),
+            format_args!("{} ({} range(s))", style::format_size(total_data), plan.ranges.len()),
         );
 
-        // Plan the compact temp-file layout: [meta][range0][range1]…
-        let (total_size, remap, bases) = plan_compact_layout(meta_len, &merged, &op_ranges);
+        let total_size = plan.total_size;
 
         // Create the temp file in the requested directory (default: system temp).
         // create_dir_all because the output dir may not exist yet at open time.
@@ -300,15 +299,18 @@ pub fn open_http_extract(
         let downloaded = Arc::new(AtomicU64::new(0));
         let sem = Arc::new(tokio::sync::Semaphore::new(8));
 
-        let mut handles = Vec::with_capacity(merged.len());
-        for (i, &(data_region_off, length)) in merged.iter().enumerate() {
+        let mut handles = Vec::with_capacity(plan.ranges.len());
+        for range in &plan.ranges {
             let client = client.clone();
             let url = url.clone();
             let downloaded = downloaded.clone();
             let sem = sem.clone();
             let write_file = write_file.clone();
-            let remote_off = payload_off + data_offset + data_region_off;
-            let file_base = bases[i];
+            let remote_off = payload_off.checked_add(data_offset)
+                .and_then(|offset| offset.checked_add(range.data_offset))
+                .context("remote operation offset overflows")?;
+            let file_base = range.file_offset;
+            let length = range.length;
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -378,45 +380,10 @@ pub fn open_http_extract(
 
         let mmap = unsafe { memmap2::Mmap::map(named.as_file()) }
             .context("failed to mmap temp payload file")?;
-        Ok(PayloadView::from_mmap_compact(mmap, remap, Box::new(named))?)
+        Ok(PayloadView::from_mmap_compact(mmap, plan.remap, Box::new(named))?)
     })
 }
 
-/// Plan the compact temp-file layout for HTTP selective download.
-///
-/// Returns `(total_size, remap, bases)` where the file is laid out as
-/// `[meta][merged[0]][merged[1]]…`: `bases[i]` is the file offset of merged
-/// range `i`, and `remap` maps each operation's payload `data_offset` to its
-/// `(file_position, length)` within the range that contains it. Pure function
-/// of offsets/lengths — no payload data needed — so it is unit-testable.
-fn plan_compact_layout(
-    meta_len: u64,
-    merged: &[(u64, u64)],
-    op_ranges: &[(u64, u64)],
-) -> (u64, HashMap<u64, (u64, u64)>, Vec<u64>) {
-    let mut bases = Vec::with_capacity(merged.len());
-    let mut cursor = meta_len;
-    for &(_, len) in merged {
-        bases.push(cursor);
-        cursor += len;
-    }
-    let total_size = cursor;
-
-    let mut remap: HashMap<u64, (u64, u64)> = HashMap::with_capacity(op_ranges.len());
-    for &(op_off, op_len) in op_ranges {
-        if remap.contains_key(&op_off) {
-            continue;
-        }
-        for (i, &(merged_off, merged_len)) in merged.iter().enumerate() {
-            if op_off >= merged_off && op_off + op_len <= merged_off + merged_len {
-                remap.insert(op_off, (bases[i] + (op_off - merged_off), op_len));
-                break;
-            }
-        }
-    }
-
-    (total_size, remap, bases)
-}
 
 /// Download a byte range and stream it straight to `file` at `file_base` via
 /// positional writes — never buffering the whole range in memory. Increments
@@ -748,75 +715,4 @@ fn resolve_zip64_fields(
         p += 4 + sz;
     }
     (local_off, csize, usize_)
-}
-
-fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    let mut merged = Vec::new();
-    let (mut cs, mut cl) = ranges[0];
-    const GAP: u64 = 256 * 1024;
-    for &(s, l) in &ranges[1..] {
-        let ce = cs + cl;
-        if s <= ce + GAP {
-            cl = (s + l).max(ce) - cs;
-        } else {
-            merged.push((cs, cl));
-            cs = s;
-            cl = l;
-        }
-    }
-    merged.push((cs, cl));
-    merged
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The compact layout packs `[meta][range0][range1]…` and remaps each op's
-    /// payload data_offset to its position within the file range that holds it.
-    #[test]
-    fn plan_compact_layout_maps_ops_into_ranges() {
-        let meta_len = 24u64;
-        let merged = [(100u64, 50u64), (200u64, 30u64)];
-        // Three ops: two inside range0, one filling range1.
-        let op_ranges = [(100u64, 10u64), (110u64, 40u64), (200u64, 30u64)];
-
-        let (total, remap, bases) = plan_compact_layout(meta_len, &merged, &op_ranges);
-
-        assert_eq!(bases, vec![24, 74]); // meta_len, meta_len + 50
-        assert_eq!(total, 24 + 50 + 30);
-        assert_eq!(remap[&100], (24, 10)); // start of range0
-        assert_eq!(remap[&110], (34, 40)); // 10 bytes into range0
-        assert_eq!(remap[&200], (74, 30)); // start of range1
-    }
-
-    /// remap positions must point at the same bytes that a contiguous on-disk
-    /// layout would, for non-adjacent ops within a merged range.
-    #[test]
-    fn plan_compact_layout_single_range_gap() {
-        let meta_len = 0u64;
-        let merged = [(0u64, 100u64)];
-        // ops at 0 and 60, leaving a gap [10,60) that stays on disk.
-        let op_ranges = [(0u64, 10u64), (60u64, 40u64)];
-
-        let (total, remap, bases) = plan_compact_layout(meta_len, &merged, &op_ranges);
-
-        assert_eq!(bases, vec![0]);
-        assert_eq!(total, 100);
-        assert_eq!(remap[&0], (0, 10));
-        assert_eq!(remap[&60], (60, 40)); // offset within the range is preserved
-    }
-
-    #[test]
-    fn merge_ranges_collapses_within_gap() {
-        // Two ranges closer than GAP merge into one spanning both.
-        let merged = merge_ranges(&[(0, 100), (100 + 1024, 50)]);
-        assert_eq!(merged, vec![(0, 100 + 1024 + 50)]);
-        // A range farther than GAP stays separate.
-        let merged = merge_ranges(&[(0, 100), (100 + 512 * 1024, 50)]);
-        assert_eq!(merged, vec![(0, 100), (100 + 512 * 1024, 50)]);
-    }
 }

@@ -16,6 +16,7 @@ Android OTA `payload.bin` extractor written in Rust.
 - **HTTP range requests** — extract specific partitions from remote OTA packages without downloading the entire file
 - **Rich operation types** — REPLACE, REPLACE_BZ, REPLACE_XZ, REPLACE_ZSTD, BROTLI_BSDIFF, LZ4DIFF_BSDIFF, ZERO, DISCARD, SOURCE_COPY, SOURCE_BSDIFF
 - **Multiple input sources** — local `.bin` files, OTA ZIP archives, HTTP/HTTPS URLs
+- **Fast ZIP metadata lookup** — validated zero-offset lookup, including ZIP64, avoids whole-OTA scans; automatic offset detection remains a compatibility fallback
 - **Delta OTA support** — incremental updates with `--source-dir`
 - **Integrity verification** — per-operation SHA256, partition hash, dm-verity hash tree, FEC
 
@@ -137,6 +138,7 @@ payload-extract -A "CustomAgent/1.0" list "https://..."
 - **HTTP 分段下载** — 从远程 OTA 包中提取指定分区，无需下载完整文件
 - **丰富的操作类型** — REPLACE、REPLACE_BZ、REPLACE_XZ、REPLACE_ZSTD、BROTLI_BSDIFF、LZ4DIFF_BSDIFF、ZERO、DISCARD、SOURCE_COPY、SOURCE_BSDIFF
 - **多输入源** — 本地 `.bin` 文件、OTA ZIP 压缩包、HTTP/HTTPS URL
+- **快速 ZIP 元数据定位** — 验证零偏移目录位置（含 ZIP64），避免扫描整份 OTA；失败时保留自动偏移探测兼容路径
 - **增量 OTA 支持** — 通过 `--source-dir` 指定旧分区目录
 - **完整性验证** — 操作级 SHA256、分区哈希、dm-verity 哈希树、FEC 前向纠错
 

@@ -1,5 +1,7 @@
 pub mod local;
 pub mod zip_input;
+#[cfg(any(test, feature = "http"))]
+pub(crate) mod ranges;
 
 #[cfg(feature = "http")]
 pub mod http;
@@ -15,29 +17,20 @@ use crate::payload::PayloadView;
 
 pub(crate) const ZIP_MAGIC: &[u8; 4] = &[0x50, 0x4B, 0x03, 0x04];
 
-/// Progress callback: `(current, total)`. Units depend on context — bytes for
-/// HTTP download, completed operations for extraction. Invoked from worker
-/// threads / async tasks, so it must be `Send + Sync`.
+/// HTTP bytes or completed operations. Native callbacks may run on worker threads.
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-/// Options for opening a payload for extraction. Defaults match the legacy
-/// `open_for_extract` (no progress callback, system temp dir).
+/// Extraction input options, including HTTP progress and temporary storage.
 #[derive(Default, Clone)]
 pub struct OpenOptions {
     /// Skip TLS certificate verification for HTTPS URLs.
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub insecure: bool,
     /// Override the HTTP `User-Agent` header.
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub user_agent: Option<String>,
     /// Invoked ~10x/s during HTTP download with `(downloaded_bytes, total_bytes)`.
     /// Never fires for local files (no download phase).
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub download_progress: Option<ProgressCallback>,
-    /// Directory for the HTTP compact temp file (default: [`std::env::temp_dir`]).
-    /// Set to the output dir to avoid tmpfs and guarantee a writable location
-    /// (required on Android).
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    /// HTTP cache directory (default: system temp); use output on Android to avoid tmpfs.
     pub temp_dir: Option<PathBuf>,
 }
 
@@ -53,13 +46,7 @@ pub fn open(input: &str, insecure: bool, user_agent: Option<&str>) -> Result<Pay
     open_local_file(input)
 }
 
-/// Open a payload for extraction. For HTTP URLs, selectively downloads
-/// only the operation data needed for the specified partitions.
-/// If `partition_names` is empty, downloads the entire payload.
-///
-/// Back-compat wrapper over [`open_for_extract_with`] with default options.
-/// Kept for external consumers (e.g. the GUI JNI layer); the CLI uses `_with`.
-#[allow(dead_code)]
+/// Open with default options; an empty partition list selects all partitions.
 pub fn open_for_extract(
     input: &str,
     partition_names: &[String],
@@ -74,8 +61,7 @@ pub fn open_for_extract(
     open_for_extract_with(input, partition_names, &opts)
 }
 
-/// Open a payload for extraction with explicit [`OpenOptions`] — lets callers
-/// observe download progress and control the temp-file location.
+/// Open with explicit options; an empty partition list selects all partitions.
 pub fn open_for_extract_with(
     input: &str,
     partition_names: &[String],

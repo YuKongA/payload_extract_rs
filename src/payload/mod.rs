@@ -1,5 +1,6 @@
 pub mod header;
 
+use std::io;
 use std::collections::HashMap;
 
 use memmap2::Mmap;
@@ -10,7 +11,7 @@ use crate::proto::{DeltaArchiveManifest, PartitionUpdate};
 
 pub use header::{HEADER_SIZE, PayloadHeader};
 
-/// Data backing for PayloadView — either mmap'd file or in-memory buffer.
+/// Native mappings or compact HTTP buffers.
 enum PayloadData {
     Mmap(Mmap),
     #[cfg(feature = "http")]
@@ -27,12 +28,9 @@ impl PayloadData {
     }
 }
 
-/// Zero-copy view over a payload file.
-///
-/// Supports two modes:
-/// - **Mmap mode**: the entire payload (or ZIP containing it) is memory-mapped.
-/// - **Compact mode** (HTTP): metadata + only needed data ranges are packed
-///   contiguously, with an offset remap table so `blob_slice_raw` still works.
+/// Parsed payload metadata and access to its operation data.
+/// Native files use zero-copy mappings.
+/// Compact HTTP inputs resolve operation offsets through a remap table.
 pub struct PayloadView {
     data: PayloadData,
     header: PayloadHeader,
@@ -41,10 +39,9 @@ pub struct PayloadView {
     data_offset: u64,
     /// Byte offset of payload within the backing data (non-zero for ZIP passthrough)
     payload_offset: u64,
-    /// Offset remap table for compact HTTP mode:
-    /// maps (original_data_region_offset, length) → position in backing data.
-    /// When present, blob_slice_raw uses this instead of direct indexing.
-    remap: Option<HashMap<u64, (u64, u64)>>, // orig_offset -> (compact_pos, length)
+    /// Strict compact-mode lookup: original data offset -> (file position, max
+    /// operation length). Missing offsets must never index unrelated cache data.
+    remap: Option<HashMap<u64, (u64, u64)>>,
     /// Owns resources released after `data` drops — e.g. the HTTP temp file,
     /// deletable only once its mmap is unmapped (required on Windows). Declared
     /// after `data` so it drops last; type-erased to avoid a `tempfile` dep here.
@@ -88,13 +85,14 @@ impl PayloadView {
         payload_offset: u64,
         remap: Option<HashMap<u64, (u64, u64)>>,
     ) -> Result<Self, PayloadError> {
-        let base = payload_offset as usize;
-        let slice = &data.as_slice()[base..];
+        let base = usize::try_from(payload_offset).map_err(|_| invalid_range())?;
+        let slice = data.as_slice().get(base..).ok_or_else(invalid_range)?;
 
         let header = PayloadHeader::parse(slice)?;
 
         let manifest_start = HEADER_SIZE;
-        let manifest_end = manifest_start + header.manifest_size as usize;
+        let manifest_end = usize::try_from(header.manifest_size).ok()
+            .and_then(|size| manifest_start.checked_add(size)).ok_or_else(invalid_range)?;
 
         if slice.len() < manifest_end {
             return Err(PayloadError::PayloadTooSmall {
@@ -104,7 +102,7 @@ impl PayloadView {
         }
 
         let manifest = DeltaArchiveManifest::decode(&slice[manifest_start..manifest_end])?;
-        let data_offset = header.data_offset();
+        let data_offset = (manifest_end as u64).checked_add(header.metadata_signature_size as u64).ok_or_else(invalid_range)?;
 
         // Advise the kernel about sequential access pattern for better readahead
         #[cfg(unix)]
@@ -153,41 +151,48 @@ impl PayloadView {
         }
     }
 
-    /// Get data for an operation's blob.
-    ///
-    /// In mmap mode: zero-copy slice into the mapped region.
-    /// In compact/remap mode: looks up the remapped position.
+    /// Borrow an operation blob directly from the backing mapping or buffer.
     #[inline]
     pub fn blob_slice_raw(
         &self,
         data_offset: u64,
         data_length: u64,
     ) -> Result<&[u8], PayloadError> {
-        let slice = self.data.as_slice();
+        self.read_range(self.blob_start(data_offset, data_length)?, data_length)
+    }
 
-        if let Some(ref remap) = self.remap {
-            // Compact mode: look up remapped position
-            if let Some(&(compact_pos, _len)) = remap.get(&data_offset) {
-                let start = compact_pos as usize;
-                let end = start + data_length as usize;
-                return slice.get(start..end).ok_or(PayloadError::PayloadTooSmall {
-                    expected: end,
-                    actual: slice.len(),
-                });
+    fn blob_start(&self, data_offset: u64, data_length: u64) -> Result<u64, PayloadError> {
+        if let Some(remap) = &self.remap {
+            // Empty operation blobs need no cached bytes, even when their
+            // unused original offset is outside the selected data region.
+            if data_length == 0 {
+                return Ok(self.data_offset);
             }
-            // Fallback: try direct indexing
+            let &(position, length) = remap.get(&data_offset).ok_or_else(invalid_range)?;
+            if data_length > length {
+                return Err(invalid_range());
+            }
+            Ok(position)
+        } else {
+            self.payload_offset.checked_add(self.data_offset)
+                .and_then(|offset| offset.checked_add(data_offset)).ok_or_else(invalid_range)
         }
+    }
 
-        // Mmap mode: direct indexing
-        let abs_start =
-            self.payload_offset as usize + self.data_offset as usize + data_offset as usize;
-        let abs_end = abs_start + data_length as usize;
-        slice
-            .get(abs_start..abs_end)
-            .ok_or(PayloadError::PayloadTooSmall {
-                expected: abs_end,
-                actual: slice.len(),
-            })
+    /// A bounded reader over one operation, independent of the OTA's total size.
+    pub fn blob_reader_raw(&self, data_offset: u64, data_length: u64) -> Result<io::Cursor<&[u8]>, PayloadError> {
+        self.blob_slice_raw(data_offset, data_length).map(io::Cursor::new)
+    }
+
+    fn read_range(&self, start: u64, length: u64) -> Result<&[u8], PayloadError> {
+        let end = start.checked_add(length).ok_or_else(invalid_range)?;
+        let start = usize::try_from(start).map_err(|_| invalid_range())?;
+        let end = usize::try_from(end).map_err(|_| invalid_range())?;
+        let slice = self.data.as_slice();
+        slice.get(start..end).ok_or(PayloadError::PayloadTooSmall {
+            expected: end,
+            actual: slice.len(),
+        })
     }
 
     #[allow(dead_code)]
@@ -220,20 +225,18 @@ impl PayloadView {
     }
 
     #[allow(dead_code)]
-    pub fn payload_signatures_bytes(&self) -> Option<&[u8]> {
-        let offset = self.manifest.signatures_offset?;
-        let size = self.manifest.signatures_size?;
-        let base = self.payload_offset as usize + self.data_offset as usize;
-        let start = base + offset as usize;
-        let end = start + size as usize;
-        let slice = self.data.as_slice();
-        if end <= slice.len() {
-            Some(&slice[start..end])
-        } else {
-            None
-        }
+    pub fn payload_signatures_bytes(&self) -> Result<Option<&[u8]>, PayloadError> {
+        let (Some(offset), Some(size)) = (self.manifest.signatures_offset, self.manifest.signatures_size) else {
+            return Ok(None);
+        };
+        self.blob_slice_raw(offset, size).map(Some)
     }
 }
+
+fn invalid_range() -> PayloadError {
+    io::Error::new(io::ErrorKind::InvalidData, "payload range is truncated, too large, or overflows").into()
+}
+
 
 // tempfile is only available under the `http` feature.
 #[cfg(all(test, feature = "http"))]
@@ -282,8 +285,95 @@ mod tests {
 
         assert_eq!(view.blob_slice_raw(1000, 16).unwrap(), &blob_a);
         assert_eq!(view.blob_slice_raw(2000, 32).unwrap(), &blob_b);
-        // Unknown offset that isn't in the remap falls through to direct
-        // indexing and should be out of bounds here.
+        // An unselected original range would land on blob A if direct indexing
+        // were allowed, so test an in-bounds alias as well as an absent range.
+        assert!(view.blob_slice_raw(0, 4).is_err());
+        assert!(view.blob_reader_raw(0, 4).is_err());
         assert!(view.blob_slice_raw(9999, 4).is_err());
+        assert!(view.blob_slice_raw(1000, 17).is_err());
+        assert!(view.blob_reader_raw(1000, 17).is_err());
+        assert!(view.blob_slice_raw(u64::MAX, 0).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = crate::storage::test_dir().join(format!("payload-ranges-{stamp}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&dir).unwrap();
+            let mut bytes = b"CrAU".to_vec();
+            bytes.extend_from_slice(&2u64.to_be_bytes());
+            bytes.extend_from_slice(&0u64.to_be_bytes());
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(b"abcXYZ");
+            std::fs::write(dir.join("payload.bin"), bytes).unwrap();
+            Self(dir)
+        }
+
+        fn open(&self) -> PayloadView {
+            crate::input::open(self.0.join("payload.bin").to_str().unwrap(), false, None).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn operation_readers_are_bounded_and_can_be_interleaved() {
+        let fixture = Fixture::new();
+        let view = fixture.open();
+        let mut first: io::Cursor<&[u8]> = view.blob_reader_raw(0, 3).unwrap();
+        let mut second = view.blob_reader_raw(3, 3).unwrap();
+        let mut byte = [0];
+        first.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"a");
+        second.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"X");
+        let mut rest = Vec::new();
+        first.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"bc");
+        rest.clear();
+        second.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"YZ");
+        assert_eq!(first.read(&mut byte).unwrap(), 0);
+        assert_eq!(view.blob_slice_raw(2, 3).unwrap(), b"cXY");
+    }
+
+    #[test]
+    fn payload_signature_ranges_are_borrowed_and_bounds_checked() {
+        let fixture = Fixture::new();
+        let mut view = fixture.open();
+        assert!(view.payload_signatures_bytes().unwrap().is_none());
+        view.manifest.signatures_offset = Some(3);
+        view.manifest.signatures_size = Some(3);
+        let signatures: &[u8] = view.payload_signatures_bytes().unwrap().unwrap();
+        assert_eq!(signatures, b"XYZ");
+        assert_eq!(signatures.as_ptr(), view.blob_slice_raw(3, 3).unwrap().as_ptr());
+        view.manifest.signatures_size = Some(4);
+        assert!(view.payload_signatures_bytes().is_err());
+    }
+
+    #[test]
+    fn truncated_and_overflowing_blob_ranges_return_errors() {
+        let fixture = Fixture::new();
+        let view = fixture.open();
+        for (offset, length) in [(5, 2), (u64::MAX, 2), (0, u64::MAX)] {
+            assert!(view.blob_slice_raw(offset, length).is_err());
+            assert!(view.blob_reader_raw(offset, length).is_err());
+        }
+        assert_eq!(view.blob_reader_raw(6, 0).unwrap().read(&mut [0; 1]).unwrap(), 0);
     }
 }

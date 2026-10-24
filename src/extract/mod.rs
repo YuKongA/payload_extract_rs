@@ -11,7 +11,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +18,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::payload::PayloadView;
+use crate::storage::ReadOnlyFile;
 use crate::style;
 
 use operation::{OpType, OperationTask};
@@ -44,11 +44,8 @@ pub struct ExtractConfig {
     pub source_dir: Option<String>,
     /// Custom output paths per partition (from --out-config)
     pub out_config: Option<HashMap<String, PathBuf>>,
-    /// Invoked as each operation completes with `(completed_ops, total_ops)`.
-    /// Fires regardless of `quiet` (headless callers still want progress) and
-    /// runs on rayon workers, so it must be `Send + Sync`. Parallel
-    /// multi-partition extraction interleaves callbacks; single-partition (the
-    /// headless case) is monotonic.
+    /// Reports `(completed_ops, total_ops)` even in quiet mode.
+    /// Native workers may invoke callbacks concurrently.
     pub progress: Option<crate::input::ProgressCallback>,
 }
 
@@ -94,29 +91,13 @@ pub fn extract_partitions(
         );
     }
 
-    // Configure rayon thread pool
-    let thread_count = if config.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-    } else {
-        config.threads
-    };
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count)
-        .build()
-        .context("failed to create thread pool")?;
-
-    // Setup progress bars
     let multi_progress = MultiProgress::new();
-    let style =
+    let progress_style =
         ProgressStyle::with_template("{prefix:>20} {msg:>10} [{bar:40.cyan/blue}] {percent:>3}%")
             .unwrap()
             .progress_chars("=> ");
 
-    pool.install(|| {
-        partitions
-            .par_iter()
-            .try_for_each(|partition| -> Result<()> {
+    let extract_partition = |partition: &&crate::proto::PartitionUpdate| -> Result<()> {
                 let part_name = &partition.partition_name;
                 let output_path = if let Some(ref out_config) = config.out_config {
                     if let Some(custom_path) = out_config.get(part_name) {
@@ -133,32 +114,35 @@ pub fn extract_partitions(
                 };
 
                 // Determine partition size
-                let part_size = partition
+                let part_size = if let Some(size) = partition
                     .new_partition_info
                     .as_ref()
                     .and_then(|info| info.size)
-                    .unwrap_or_else(|| {
-                        partition
-                            .operations
-                            .iter()
-                            .flat_map(|op| &op.dst_extents)
-                            .map(|ext| {
-                                (ext.start_block.unwrap_or(0) + ext.num_blocks.unwrap_or(0))
-                                    * block_size as u64
-                            })
-                            .max()
-                            .unwrap_or(0)
-                    });
+                {
+                    size
+                } else {
+                    partition.operations.iter().try_fold(0, |size, op| {
+                        op.dst_extents.iter().try_fold(size, |size, extent| {
+                            let start = extent.start_block.unwrap_or(0);
+                            if start == u64::MAX {
+                                return Ok::<u64, anyhow::Error>(size);
+                            }
+                            let end = start.checked_add(extent.num_blocks.unwrap_or(0))
+                                .and_then(|end| end.checked_mul(block_size as u64))
+                                .context("destination extent size overflow")?;
+                            Ok(size.max(end))
+                        })
+                    })?
+                };
 
                 // Create pre-allocated output file
-                let writer = Arc::new(PartitionWriter::new(&output_path, part_size, block_size)?);
+                let writer = PartitionWriter::new(&output_path, part_size, block_size)?;
 
                 // Open source partition for delta OTA if needed
-                let source_mmap = if let Some(ref source_dir) = config.source_dir {
+                let source_file = if let Some(source_dir) = &config.source_dir {
                     let src_path = Path::new(source_dir).join(format!("{part_name}.img"));
-                    if src_path.exists() {
-                        let file = std::fs::File::open(&src_path)?;
-                        Some(unsafe { memmap2::Mmap::map(&file) }?)
+                    if std::fs::exists(&src_path)? {
+                        Some(ReadOnlyFile::open(&src_path)?)
                     } else {
                         None
                     }
@@ -202,7 +186,7 @@ pub fn extract_partitions(
                 // Setup progress bar
                 let pb = if !config.quiet {
                     let pb = multi_progress.add(ProgressBar::new(tasks.len() as u64));
-                    pb.set_style(style.clone());
+                    pb.set_style(progress_style.clone());
                     pb.set_prefix(style::bold().apply_to(part_name).to_string());
                     pb.set_message(style::format_size(part_size));
                     Some(pb)
@@ -213,15 +197,14 @@ pub fn extract_partitions(
                 let completed = AtomicU64::new(0);
                 let total_ops = tasks.len() as u64;
 
-                // Execute operations in parallel via rayon
-                tasks.par_iter().try_for_each(|task| -> Result<()> {
+                let process_task = |task: &OperationTask| -> Result<()> {
                     process_operation(
                         payload,
                         task,
                         &writer,
                         block_size,
                         config,
-                        source_mmap.as_deref(),
+                        source_file.as_ref(),
                     )?;
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -235,15 +218,26 @@ pub fn extract_partitions(
                     }
 
                     Ok(())
-                })?;
+                };
+                tasks.par_iter().try_for_each(process_task)?;
 
                 if let Some(pb) = &pb {
                     pb.finish();
                 }
 
                 Ok(())
-            })
-    })
+    };
+
+    let thread_count = if config.threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        config.threads
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .context("failed to create thread pool")?;
+    pool.install(|| partitions.par_iter().try_for_each(extract_partition))
 }
 
 /// Process a single extraction operation.
@@ -253,7 +247,7 @@ fn process_operation(
     writer: &PartitionWriter,
     block_size: u32,
     config: &ExtractConfig,
-    source_data: Option<&[u8]>,
+    source_data: Option<&ReadOnlyFile>,
 ) -> Result<()> {
     match task.op_type {
         OpType::Zero | OpType::Discard => {
@@ -261,26 +255,26 @@ fn process_operation(
             // content on all major platforms (Linux ext4/btrfs, Windows NTFS, macOS APFS).
             // Skipping explicit zero writes avoids redundant I/O.
         }
-        OpType::Replace => {
-            // Zero-copy: slice directly from mmap and pwrite to output
-            let blob = get_blob(payload, task)?;
-
-            if config.verify_ops {
-                verify::verify_sha256(blob, &task.data_sha256)?;
+        OpType::Replace | OpType::ReplaceBz | OpType::ReplaceXz | OpType::ReplaceZstd => {
+            if task.op_type == OpType::Replace {
+                let blob = get_blob(payload, task)?;
+                if config.verify_ops {
+                    verify::verify_sha256(blob, &task.data_sha256)?;
+                }
+                return write_to_extents(blob, &task.dst_extents, writer, block_size);
             }
-
-            write_to_extents(blob, &task.dst_extents, writer, block_size)?;
+            if config.verify_ops {
+                verify_blob(payload, task)?;
+            }
+            let input = payload.blob_reader_raw(task.data_offset, task.data_length)?;
+            let mut reader = decompress::decoder_for(task.op_type, input)?;
+            let mut sink = ExtentWriter::new(writer, block_size, &task.dst_extents);
+            stream_to_extents(&mut reader, &mut sink)?;
         }
         OpType::SourceCopy => {
             let src = source_data
                 .ok_or_else(|| anyhow::anyhow!("SOURCE_COPY requires source partition data"))?;
-            bufpool::with_extent_buffer(
-                extents_byte_size(&task.src_extents, block_size) as usize,
-                |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf);
-                    write_to_extents(buf, &task.dst_extents, writer, block_size)
-                },
-            )?;
+            copy_source_extents(src, &task.src_extents, &task.dst_extents, writer, block_size)?;
         }
         OpType::SourceBsdiff | OpType::BrotliBsdiff => {
             // BSDIFF40 (bz2) / BSDF2 (brotli) are both magic-prefixed bsdiff
@@ -293,9 +287,9 @@ fn process_operation(
                 verify::verify_sha256(blob, &task.data_sha256)?;
             }
             bufpool::with_extent_buffer(
-                extents_byte_size(&task.src_extents, block_size) as usize,
+                0,
                 |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf);
+                    read_from_extents(src, &task.src_extents, block_size, buf)?;
                     let mut patched = Vec::new();
                     bsdiff_android::patch_bsdf2(buf, blob, &mut patched)
                         .map_err(|e| anyhow::anyhow!("{:?} patch failed: {e}", task.op_type))?;
@@ -326,91 +320,130 @@ fn process_operation(
                 verify::verify_sha256(blob, &task.data_sha256)?;
             }
             bufpool::with_extent_buffer(
-                extents_byte_size(&task.src_extents, block_size) as usize,
+                0,
                 |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf);
+                    read_from_extents(src, &task.src_extents, block_size, buf)?;
                     let patched = lz4diff::apply_lz4diff(buf, blob, task.op_type)?;
                     write_to_extents(&patched, &task.dst_extents, writer, block_size)
                 },
             )?;
-        }
-        OpType::ReplaceBz | OpType::ReplaceXz | OpType::ReplaceZstd => {
-            // Compressed full-OTA operation: stream-decode straight to the
-            // destination extents. Peak memory is one CHUNK, independent of the
-            // decompressed output size — no partition-proportional buffer.
-            let blob = get_blob(payload, task)?;
-
-            if config.verify_ops {
-                verify::verify_sha256(blob, &task.data_sha256)?;
-            }
-
-            let mut reader = decompress::decoder_for(task.op_type, blob)?;
-            let mut sink = ExtentWriter::new(writer, block_size, &task.dst_extents);
-
-            DECODE_CHUNK.with(|cell| -> Result<()> {
-                let mut buf = cell.borrow_mut();
-                if buf.len() < DECODE_CHUNK_SIZE {
-                    buf.resize(DECODE_CHUNK_SIZE, 0); // one-time allocation per thread
-                }
-                loop {
-                    // Fill the chunk before flushing so writes are batched into
-                    // large pwrites rather than one syscall per decoder read.
-                    let mut filled = 0;
-                    while filled < DECODE_CHUNK_SIZE {
-                        let n = reader
-                            .read(&mut buf[filled..])
-                            .map_err(|e| anyhow::anyhow!("decompression read failed: {e}"))?;
-                        if n == 0 {
-                            break;
-                        }
-                        filled += n;
-                    }
-                    if filled == 0 {
-                        break;
-                    }
-                    sink.write(&buf[..filled])?;
-                    if filled < DECODE_CHUNK_SIZE {
-                        break; // decoder exhausted
-                    }
-                }
-                Ok(())
-            })?;
         }
     }
 
     Ok(())
 }
 
-/// Get blob data for an operation from the payload (zero-copy mmap slice).
+/// Borrow operation bytes directly from the payload mapping.
 #[inline]
 fn get_blob<'a>(payload: &'a PayloadView, task: &OperationTask) -> Result<&'a [u8]> {
     Ok(payload.blob_slice_raw(task.data_offset, task.data_length)?)
 }
 
-/// Calculate the total byte size of extents.
-fn extents_byte_size(extents: &[(u64, u64)], block_size: u32) -> u64 {
-    extents
-        .iter()
-        .map(|&(_, num_blocks)| num_blocks * block_size as u64)
-        .sum()
+/// Verify operation input directly from the payload mapping.
+fn verify_blob(payload: &PayloadView, task: &OperationTask) -> Result<()> {
+    if task.data_sha256.is_none() {
+        return Ok(());
+    }
+    Ok(verify::verify_sha256(get_blob(payload, task)?, &task.data_sha256)?)
 }
 
-/// Read data from source partition by extents into a buffer.
-fn read_from_extents(source: &[u8], extents: &[(u64, u64)], block_size: u32, buf: &mut Vec<u8>) {
-    let total_size = extents_byte_size(extents, block_size) as usize;
-    buf.clear();
-    if buf.capacity() < total_size {
-        buf.reserve(total_size - buf.capacity());
-    }
-
-    for &(start_block, num_blocks) in extents {
-        let offset = (start_block * block_size as u64) as usize;
-        let len = (num_blocks * block_size as u64) as usize;
-        let end = (offset + len).min(source.len());
-        if offset < source.len() {
-            buf.extend_from_slice(&source[offset..end]);
+fn stream_to_extents(reader: &mut impl Read, sink: &mut ExtentWriter<'_>) -> Result<()> {
+    DECODE_CHUNK.with(|cell| -> Result<()> {
+        let mut buffer = cell.borrow_mut();
+        buffer.resize(DECODE_CHUNK_SIZE, 0);
+        loop {
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match reader.read(&mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error).context("operation stream read failed"),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            sink.write(&buffer[..filled])?;
         }
+        Ok(())
+    })
+}
+
+fn extents_byte_size(extents: &[(u64, u64)], block_size: u32) -> Result<usize> {
+    let size = extents.iter().try_fold(0u64, |total, &(_, blocks)| {
+        blocks.checked_mul(block_size as u64)
+            .and_then(|length| total.checked_add(length))
+            .context("source extent size overflow")
+    })?;
+    usize::try_from(size).context("source extents exceed address space")
+}
+
+/// Sparse source extents represent zero bytes, not a file offset. Non-sparse
+/// extents must be present in full; silently truncating would corrupt patches.
+fn read_from_extents(
+    source: &ReadOnlyFile,
+    extents: &[(u64, u64)],
+    block_size: u32,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    let size = extents_byte_size(extents, block_size)?;
+    buffer.clear();
+    buffer.try_reserve(size).context("source extent allocation failed")?;
+    buffer.resize(size, 0);
+    let mut position = 0;
+    for &(start, blocks) in extents {
+        let length = blocks.checked_mul(block_size as u64)
+            .and_then(|length| usize::try_from(length).ok())
+            .context("source extent size overflow")?;
+        if start != u64::MAX {
+            let offset = start.checked_mul(block_size as u64)
+                .context("source extent offset overflow")?;
+            source.read_exact_at(&mut buffer[position..position + length], offset)
+                .context("source extent is truncated or unreadable")?;
+        }
+        position += length;
     }
+    Ok(())
+}
+
+/// SOURCE_COPY uses constant scratch space even for partition-sized extents.
+fn copy_source_extents(
+    source: &ReadOnlyFile,
+    extents: &[(u64, u64)],
+    destinations: &[(u64, u64)],
+    writer: &PartitionWriter,
+    block_size: u32,
+) -> Result<()> {
+    let mut sink = ExtentWriter::new(writer, block_size, destinations);
+    DECODE_CHUNK.with(|cell| -> Result<()> {
+        let mut buffer = cell.borrow_mut();
+        for &(start, blocks) in extents {
+            let length = blocks.checked_mul(block_size as u64)
+                .context("source extent size overflow")?;
+            let offset = if start == u64::MAX { 0 } else {
+                let offset = start.checked_mul(block_size as u64)
+                    .context("source extent offset overflow")?;
+                if offset.checked_add(length).is_none_or(|end| end > source.len()) {
+                    bail!("source extent is truncated");
+                }
+                offset
+            };
+            let mut position = 0u64;
+            while position < length {
+                let count = (length - position).min(DECODE_CHUNK_SIZE as u64) as usize;
+                if start == u64::MAX {
+                    buffer.resize(count, 0);
+                    buffer.fill(0);
+                    sink.write(&buffer)?;
+                } else {
+                    sink.write(source.read_range(offset + position, count)?)?;
+                }
+                position += count as u64;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Write decompressed data to non-contiguous destination extents.
@@ -420,14 +453,7 @@ fn write_to_extents(
     writer: &PartitionWriter,
     block_size: u32,
 ) -> Result<()> {
-    let mut data_offset = 0usize;
-    for &(start_block, num_blocks) in extents {
-        let extent_size = (num_blocks * block_size as u64) as usize;
-        let end = (data_offset + extent_size).min(data.len());
-        writer.write_at_block(&data[data_offset..end], start_block)?;
-        data_offset = end;
-    }
-    Ok(())
+    ExtentWriter::new(writer, block_size, extents).write(data)
 }
 
 /// Sequentially writes a streamed byte sequence across a partition's destination
@@ -458,21 +484,25 @@ impl<'a> ExtentWriter<'a> {
 
     fn write(&mut self, mut data: &[u8]) -> Result<()> {
         while !data.is_empty() {
-            // Advance past any extents already filled to capacity.
-            while self.idx < self.extents.len()
-                && self.pos_in_extent >= self.extents[self.idx].1 * self.block_size
-            {
-                self.idx += 1;
-                self.pos_in_extent = 0;
-            }
             if self.idx >= self.extents.len() {
                 break; // output exceeds extent capacity; drop the remainder
             }
             let (start_block, num_blocks) = self.extents[self.idx];
-            let remaining = num_blocks * self.block_size - self.pos_in_extent;
+            let capacity = num_blocks.checked_mul(self.block_size)
+                .context("destination extent size overflow")?;
+            if self.pos_in_extent >= capacity {
+                self.idx += 1;
+                self.pos_in_extent = 0;
+                continue;
+            }
+            let remaining = capacity - self.pos_in_extent;
             let n = (data.len() as u64).min(remaining) as usize;
-            let offset = start_block * self.block_size + self.pos_in_extent;
-            self.writer.write_at(&data[..n], offset)?;
+            if start_block != u64::MAX {
+                let offset = start_block.checked_mul(self.block_size)
+                    .and_then(|offset| offset.checked_add(self.pos_in_extent))
+                    .context("destination extent offset overflow")?;
+                self.writer.write_at(&data[..n], offset)?;
+            }
             self.pos_in_extent += n as u64;
             data = &data[n..];
         }
@@ -484,6 +514,45 @@ impl<'a> ExtentWriter<'a> {
 mod stream_tests {
     use super::*;
 
+    #[test]
+    fn source_extents_preserve_holes_and_reject_truncation() {
+        let path = crate::storage::test_dir().join("pe_sparse_extent_source.img");
+        std::fs::write(&path, b"abcdefghijkl").unwrap();
+        let source = ReadOnlyFile::open(&path).unwrap();
+        let mut buffer = Vec::new();
+        read_from_extents(&source, &[(1, 1), (u64::MAX, 2), (0, 1)], 4, &mut buffer).unwrap();
+        assert_eq!(buffer, b"efgh\0\0\0\0\0\0\0\0abcd");
+        assert!(read_from_extents(&source, &[(2, 2)], 4, &mut buffer).is_err());
+        assert!(read_from_extents(&source, &[(u64::MAX - 1, 1)], 4, &mut buffer).is_err());
+        assert!(extents_byte_size(&[(0, u64::MAX)], 4).is_err());
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn source_copy_streams_across_sparse_extents() {
+        let source_path = crate::storage::test_dir().join("pe_stream_source.img");
+        let output_path = crate::storage::test_dir().join("pe_stream_destination.img");
+        let bytes = vec![0x5a; DECODE_CHUNK_SIZE + 7];
+        std::fs::write(&source_path, &bytes).unwrap();
+        let source = ReadOnlyFile::open(&source_path).unwrap();
+        let writer = PartitionWriter::new(&output_path, bytes.len() as u64 + 3, 1).unwrap();
+        copy_source_extents(
+            &source, &[(0, bytes.len() as u64), (u64::MAX, 3)],
+            &[(0, 5), (5, bytes.len() as u64 - 2)], &writer, 1,
+        ).unwrap();
+        drop(writer);
+        let actual = std::fs::read(&output_path).unwrap();
+        assert_eq!(&actual[..bytes.len()], &bytes);
+        assert_eq!(&actual[bytes.len()..], &[0, 0, 0]);
+        let writer = PartitionWriter::new(&output_path, 4, 1).unwrap();
+        assert!(copy_source_extents(&source, &[(bytes.len() as u64, 1)], &[(0, 1)], &writer, 1).is_err());
+        drop(writer);
+        drop(source);
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(output_path).unwrap();
+    }
+
     /// Streaming across extents in awkward chunk sizes must produce byte-identical
     /// output to the original whole-buffer `write_to_extents`.
     #[test]
@@ -493,7 +562,7 @@ mod stream_tests {
         let total = (3 + 1 + 2) * bs as usize;
         let data: Vec<u8> = (0..total).map(|i| (i.wrapping_mul(7).wrapping_add(3)) as u8).collect();
 
-        let dir = std::env::temp_dir();
+        let dir = crate::storage::test_dir();
         let pa = dir.join("pe_ew_a.img");
         let pb = dir.join("pe_ew_b.img");
         let _ = std::fs::remove_file(&pa);
@@ -547,7 +616,7 @@ mod stream_tests {
             (OpType::ReplaceXz, &x),
             (OpType::ReplaceBz, &b),
         ] {
-            let mut reader = decompress::decoder_for(ot, comp).unwrap();
+            let mut reader = decompress::decoder_for(ot, comp.as_slice()).unwrap();
             let mut out = Vec::new();
             let mut buf = [0u8; 7]; // tiny chunks stress the streaming loop
             loop {

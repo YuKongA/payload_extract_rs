@@ -5,3 +5,4 @@ pub mod ota_metadata;
 pub mod payload;
 pub mod proto;
 pub mod style;
+pub mod storage;

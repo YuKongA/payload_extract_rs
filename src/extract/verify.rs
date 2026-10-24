@@ -1,6 +1,10 @@
 use sha2::{Digest, Sha256};
 
 use crate::proto::PartitionUpdate;
+use crate::storage::ReadOnlyFile;
+
+use super::verify_update::{FecBuffers, fec_layout, tree_layout};
+use super::verify_update::SHA256_DIGEST_SIZE;
 
 /// Verify SHA256 hash of data against expected hash.
 /// Returns Ok(()) if hashes match or if expected is None.
@@ -20,147 +24,281 @@ pub fn verify_sha256(
     Ok(())
 }
 
-/// Verify a complete partition file against expected hash.
+/// Verify a partition's declared prefix using its native mapping.
+/// A short file fails verification; trailing bytes are not hashed.
 pub fn verify_partition(
     path: &std::path::Path,
     expected_hash: &[u8],
     expected_size: u64,
 ) -> anyhow::Result<bool> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { memmap2::Mmap::map(&file) }?;
-
-    if (mmap.len() as u64) < expected_size {
-        return Ok(false);
-    }
-
-    let actual = Sha256::digest(&mmap[..expected_size as usize]);
-    Ok(actual.as_slice() == expected_hash)
+    verify_partition_file(&ReadOnlyFile::open(path)?, expected_hash, expected_size)
 }
 
-/// Verify dm-verity hash tree for a partition.
-///
-/// The hash tree is a Merkle tree where:
-/// - Leaf nodes are SHA256 hashes of data blocks (with salt prepended)
-/// - Internal nodes are SHA256 hashes of child hashes (with salt prepended)
-/// - The root hash should match the expected value in the manifest
+/// Verify an already-open partition, allowing tree/FEC checks to reuse its handle.
+pub fn verify_partition_file(
+    file: &ReadOnlyFile,
+    expected_hash: &[u8],
+    expected_size: u64,
+) -> anyhow::Result<bool> {
+    if file.len() < expected_size {
+        return Ok(false);
+    }
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    while offset < expected_size {
+        let length = (expected_size - offset).min(CHUNK_SIZE as u64) as usize;
+        hasher.update(file.read_range(offset, length)?);
+        offset += length as u64;
+    }
+    Ok(hasher.finalize().as_slice() == expected_hash)
+}
+
+/// Verify every salted SHA256 hash and padding byte in the stored dm-verity
+/// tree. The root-first layout matches generation; only one expected hash block
+/// is buffered, not a partition-sized collection of data-block hashes.
 pub fn verify_hash_tree(
-    partition_data: &[u8],
+    file: &ReadOnlyFile,
     partition: &PartitionUpdate,
     block_size: u32,
 ) -> anyhow::Result<bool> {
-    let hash_tree_data_extent = match &partition.hash_tree_data_extent {
-        Some(ext) => ext,
-        None => return Ok(true), // No hash tree to verify
+    let Some(levels) = tree_layout(partition, block_size, file.len())? else {
+        return Ok(true);
     };
-    let hash_tree_extent = match &partition.hash_tree_extent {
-        Some(ext) => ext,
-        None => return Ok(true),
-    };
-
+    let bs = block_size as usize;
     let salt = partition.hash_tree_salt.as_deref().unwrap_or(&[]);
-    let algorithm = partition.hash_tree_algorithm.as_deref().unwrap_or("sha256");
-
-    if algorithm != "sha256" {
-        anyhow::bail!("unsupported hash tree algorithm: '{algorithm}' (only sha256 is supported)");
-    }
-
-    // Calculate data range covered by hash tree
-    let data_start = hash_tree_data_extent.start_block.unwrap_or(0) * block_size as u64;
-    let data_blocks = hash_tree_data_extent.num_blocks.unwrap_or(0);
-    let data_end = data_start + data_blocks * block_size as u64;
-
-    // Hash tree storage location
-    let tree_start = hash_tree_extent.start_block.unwrap_or(0) * block_size as u64;
-    let tree_blocks = hash_tree_extent.num_blocks.unwrap_or(0);
-    let tree_end = tree_start + tree_blocks * block_size as u64;
-
-    if data_end as usize > partition_data.len() || tree_end as usize > partition_data.len() {
-        return Ok(false);
-    }
-
-    // Compute leaf-level hashes (hash of each data block with salt)
-    let mut level_hashes: Vec<Vec<u8>> = Vec::new();
-    for block_idx in 0..data_blocks {
-        let offset = (data_start + block_idx * block_size as u64) as usize;
-        let end = offset + block_size as usize;
-        let block_data = &partition_data[offset..end];
-
-        let mut hasher = Sha256::new();
-        hasher.update(salt);
-        hasher.update(block_data);
-        level_hashes.push(hasher.finalize().to_vec());
-    }
-
-    // Build tree levels until we reach a single root hash
-    while level_hashes.len() > 1 {
-        let hash_size = 32; // SHA256
-        let hashes_per_block = block_size as usize / hash_size;
-        let mut next_level = Vec::new();
-
-        for chunk in level_hashes.chunks(hashes_per_block) {
-            let mut hasher = Sha256::new();
-            hasher.update(salt);
-            for h in chunk {
-                hasher.update(h);
+    let mut expected = vec![0u8; bs];
+    for level in levels {
+        for block in 0..level.output_size / u64::from(block_size) {
+            expected.fill(0);
+            let slots = bs / SHA256_DIGEST_SIZE;
+            let first = block * slots as u64;
+            let count = level.input_blocks.saturating_sub(first).min(slots as u64);
+            for slot in 0..count {
+                let input = file.read_range(level.input_offset + (first + slot) * bs as u64, bs)?;
+                let mut hasher = Sha256::new();
+                hasher.update(salt);
+                hasher.update(input);
+                let dst = slot as usize * SHA256_DIGEST_SIZE;
+                expected[dst..dst + SHA256_DIGEST_SIZE].copy_from_slice(&hasher.finalize());
             }
-            // Pad with zeros if chunk is smaller than hashes_per_block
-            for _ in chunk.len()..hashes_per_block {
-                hasher.update([0u8; 32]);
+            let stored = file.read_range(level.output_offset + block * bs as u64, bs)?;
+            if stored != expected.as_slice() {
+                return Ok(false);
             }
-            next_level.push(hasher.finalize().to_vec());
-        }
-
-        level_hashes = next_level;
-    }
-
-    // Compare computed hash tree with stored hash tree
-    let stored_tree = &partition_data[tree_start as usize..tree_end as usize];
-    if level_hashes.len() == 1 {
-        // Root hash is the first 32 bytes of the stored tree
-        if stored_tree.len() >= 32 {
-            return Ok(level_hashes[0] == stored_tree[..32]);
         }
     }
-
     Ok(true)
 }
 
-/// Verify Forward Error Correction (FEC) data for a partition.
-///
-/// FEC uses Reed-Solomon codes to provide redundancy for data recovery.
-/// This verifies that the FEC data is consistent with the partition data.
+/// Re-encode each interleaved Android Reed-Solomon round and compare all parity
+/// bytes. Valid zero parity is accepted; nonzero but corrupt parity is rejected.
 pub fn verify_fec(
-    partition_data: &[u8],
+    file: &ReadOnlyFile,
     partition: &PartitionUpdate,
     block_size: u32,
 ) -> anyhow::Result<bool> {
-    let fec_data_extent = match &partition.fec_data_extent {
-        Some(ext) => ext,
-        None => return Ok(true), // No FEC to verify
+    let Some(layout) = fec_layout(partition, block_size, file.len())? else {
+        return Ok(true);
     };
-    let fec_extent = match &partition.fec_extent {
-        Some(ext) => ext,
-        None => return Ok(true),
-    };
+    let mut buffers = FecBuffers::new(&layout)?;
+    let chunk_size = buffers.parity.len() as u64;
+    for round in 0..layout.rounds {
+        buffers.encode(&layout, round, |buf, offset| file.read_exact_at(buf, offset))?;
+        let stored = file.read_range(layout.parity.start + round * chunk_size, buffers.parity.len())?;
+        if stored != buffers.parity.as_slice() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
-    // Full Reed-Solomon FEC verification is not yet implemented;
-    // only basic integrity check (non-zero FEC region) is performed.
-    let _fec_roots = partition.fec_roots.unwrap_or(2);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::fec::RsEncoder;
+    use crate::extract::verify_update::{compute_and_write_fec, compute_and_write_hash_tree, verify_update_partitions};
+    use crate::proto::Extent;
+    use crate::storage::{read_exact_at, write_all_at};
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Verify FEC extents are within bounds
-    let fec_data_start = fec_data_extent.start_block.unwrap_or(0) * block_size as u64;
-    let fec_data_end = fec_data_start + fec_data_extent.num_blocks.unwrap_or(0) * block_size as u64;
-    let fec_start = fec_extent.start_block.unwrap_or(0) * block_size as u64;
-    let fec_end = fec_start + fec_extent.num_blocks.unwrap_or(0) * block_size as u64;
-
-    if fec_data_end as usize > partition_data.len() || fec_end as usize > partition_data.len() {
-        return Ok(false);
+    struct Image {
+        path: PathBuf,
+        file: File,
     }
 
-    // Basic integrity check: FEC data region exists and is non-empty
-    let fec_data_region = &partition_data[fec_start as usize..fec_end as usize];
-    let all_zeros = fec_data_region.iter().all(|&b| b == 0);
+    impl Image {
+        fn new(size: u64) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let path = crate::storage::test_dir().join(format!(
+                    "payload-verify-{stamp}-{}.img", NEXT.fetch_add(1, Ordering::Relaxed),
+                ));
+                match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                    Ok(file) => {
+                        file.set_len(size).unwrap();
+                        return Self { path, file };
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("creating test image: {e}"),
+                }
+            }
+        }
 
-    // If FEC data is all zeros, it's likely not populated
-    Ok(!all_zeros || fec_data_region.is_empty())
+        fn read_only(&self) -> ReadOnlyFile {
+            ReadOnlyFile::open(&self.path).unwrap()
+        }
+    }
+
+    impl Drop for Image {
+        fn drop(&mut self) {
+            // Windows permits unlinking ordinary std::fs::File handles once all
+            // read-only mappings created by the checks have been dropped.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn extent(start: u64, blocks: u64) -> Option<Extent> {
+        Some(Extent { start_block: Some(start), num_blocks: Some(blocks) })
+    }
+
+    #[test]
+    fn partition_hash_checks_empty_short_and_prefix() {
+        let image = Image::new(0);
+        assert!(verify_partition(&image.path, &Sha256::digest([]), 0).unwrap());
+        assert!(!verify_partition(&image.path, &Sha256::digest([1]), 1).unwrap());
+        write_all_at(&image.file, &[1, 2, 3, 4], 0).unwrap();
+        assert!(verify_partition(&image.path, &Sha256::digest([1, 2]), 2).unwrap());
+        assert!(!verify_partition(&image.path, &Sha256::digest([1, 3]), 2).unwrap());
+    }
+
+    #[test]
+    fn tree_layout_matches_independent_multilevel_reference_and_detects_corruption() {
+        const BS: usize = 64;
+        // Five data blocks need three leaf, two intermediate and one root block.
+        let image = Image::new((11 * BS) as u64);
+        let data: Vec<u8> = (0..5 * BS).map(|n| (n * 17 + 3) as u8).collect();
+        write_all_at(&image.file, &data, 0).unwrap();
+        let partition = PartitionUpdate {
+            hash_tree_data_extent: extent(0, 5),
+            hash_tree_extent: extent(5, 6),
+            hash_tree_salt: Some(vec![9, 8, 7]),
+            ..Default::default()
+        };
+        let mut source = data;
+        let mut reference_levels = Vec::new();
+        loop {
+            let mut hashes = Vec::new();
+            for block in source.chunks_exact(BS) {
+                let mut hash = Sha256::new();
+                hash.update([9, 8, 7]);
+                hash.update(block);
+                hashes.extend_from_slice(&hash.finalize());
+            }
+            hashes.resize(hashes.len().div_ceil(BS) * BS, 0);
+            let root = hashes.len() == BS;
+            reference_levels.push(hashes.clone());
+            source = hashes;
+            if root { break; }
+        }
+        let reference: Vec<u8> = reference_levels.into_iter().rev().flatten().collect();
+        assert!(compute_and_write_hash_tree(&partition, &image.path, BS as u32).unwrap());
+        let mut actual = vec![0u8; reference.len()];
+        read_exact_at(&image.file, &mut actual, (5 * BS) as u64).unwrap();
+        assert_eq!(actual, reference);
+        assert!(verify_hash_tree(&image.read_only(), &partition, BS as u32).unwrap());
+        // Corrupt each stored level, including its padding, then restore it.
+        for offset in [5 * BS, 6 * BS, 8 * BS, 11 * BS - 1] {
+            let original = reference[offset - 5 * BS];
+            write_all_at(&image.file, &[original ^ 1], offset as u64).unwrap();
+            assert!(!verify_hash_tree(&image.read_only(), &partition, BS as u32).unwrap());
+            write_all_at(&image.file, &[original], offset as u64).unwrap();
+        }
+        write_all_at(&image.file, &[123], 0).unwrap();
+        assert!(!verify_hash_tree(&image.read_only(), &partition, BS as u32).unwrap());
+    }
+
+    #[test]
+    fn fec_checks_all_rounds_and_accepts_zero_parity() {
+        const BS: usize = 4096;
+        // 254 data blocks span two RS(255,253) rounds, exercising interleaving.
+        let image = Image::new((258 * BS) as u64);
+        let partition = PartitionUpdate {
+            fec_data_extent: extent(0, 254),
+            fec_extent: extent(254, 4),
+            fec_roots: Some(2),
+            ..Default::default()
+        };
+        assert!(verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
+        // Deterministic input, constant within each block, permits an independent
+        // column-wise oracle without using the generation layout/round helper.
+        for block in 0..254 {
+            write_all_at(&image.file, &vec![(block * 29 + 11) as u8; BS], (block * BS) as u64).unwrap();
+        }
+        assert!(compute_and_write_fec(&partition, &image.path, BS as u32).unwrap());
+        let encoder = RsEncoder::new(2);
+        for round in 0..2 {
+            let mut symbols = [0u8; 253];
+            for (symbol, value) in symbols.iter_mut().enumerate() {
+                let block = symbol * 2 + round;
+                if block < 254 { *value = (block * 29 + 11) as u8; }
+            }
+            let mut parity = [0u8; 2];
+            encoder.encode(&symbols, &mut parity);
+            let mut actual = vec![0u8; 2 * BS];
+            read_exact_at(&image.file, &mut actual, ((254 + round * 2) * BS) as u64).unwrap();
+            assert!(actual.chunks_exact(2).all(|column| column == parity));
+        }
+        assert!(verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
+        let parity_offset = (257 * BS + 23) as u64;
+        let mut original = [0];
+        read_exact_at(&image.file, &mut original, parity_offset).unwrap();
+        write_all_at(&image.file, &[original[0] ^ 1], parity_offset).unwrap();
+        assert!(!verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
+        write_all_at(&image.file, &original, parity_offset).unwrap();
+        write_all_at(&image.file, &[99], (253 * BS) as u64).unwrap();
+        assert!(!verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
+    }
+
+    #[test]
+    fn update_honors_custom_paths_and_fec_without_tree() {
+        const BS: u64 = 4096;
+        let image = Image::new(3 * BS);
+        write_all_at(&image.file, &[17], 0).unwrap();
+        let partition = PartitionUpdate {
+            partition_name: "custom_fec".to_owned(),
+            fec_data_extent: extent(0, 1),
+            fec_extent: extent(1, 2),
+            ..Default::default()
+        };
+        let paths = HashMap::from([(partition.partition_name.clone(), image.path.clone())]);
+        verify_update_partitions(&[&partition], &image.path, BS as u32, 1, Some(&paths), true).unwrap();
+        assert!(verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
+    }
+
+    #[test]
+    fn malformed_metadata_returns_errors() {
+        let image = Image::new(4096);
+        let mut partition = PartitionUpdate {
+            hash_tree_data_extent: extent(u64::MAX, 1),
+            hash_tree_extent: extent(0, 1),
+            ..Default::default()
+        };
+        assert!(verify_hash_tree(&image.read_only(), &partition, 4096).is_err());
+        assert!(verify_hash_tree(&image.read_only(), &partition, 32).is_err());
+        partition = PartitionUpdate {
+            fec_data_extent: extent(0, 1),
+            fec_extent: extent(1, 2),
+            fec_roots: Some(255),
+            ..Default::default()
+        };
+        assert!(verify_fec(&image.read_only(), &partition, 4096).is_err());
+        partition.fec_roots = Some(2);
+        assert!(verify_fec(&image.read_only(), &partition, 4096).is_err());
+        assert!(verify_fec(&image.read_only(), &partition, 512).is_err());
+    }
 }

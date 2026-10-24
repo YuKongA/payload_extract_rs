@@ -149,6 +149,7 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
             &args.output,
             payload.block_size(),
             args.threads,
+            config.out_config.as_ref(),
             args.quiet,
         )?;
 
