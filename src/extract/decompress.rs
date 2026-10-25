@@ -18,8 +18,10 @@ pub fn decoder_for<'a, R: Read + 'a>(
         OpType::Replace => Box::new(input),
         OpType::ReplaceBz => Box::new(bzip2::read::BzDecoder::new(input)),
         OpType::ReplaceXz => Box::new(xz2::read::XzDecoder::new(input)),
-        OpType::ReplaceZstd => Box::new(zstd::Decoder::new(input)
-            .map_err(|e| PayloadError::DecompressionFailed(format!("zstd: {e}")))?),
+        OpType::ReplaceZstd => Box::new(
+            zstd::Decoder::new(input)
+                .map_err(|e| PayloadError::DecompressionFailed(format!("zstd: {e}")))?,
+        ),
         OpType::Zero => Box::new(std::io::empty()),
         other => return Err(PayloadError::UnsupportedOperation(other as i32)),
     })

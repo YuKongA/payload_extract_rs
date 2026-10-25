@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use prost::Message;
 
-use crate::storage::write_all_at;
 use crate::ota_metadata::{self, OtaMetadataData};
 use crate::payload::PayloadView;
 use crate::payload::header::{HEADER_SIZE, MAGIC, PayloadHeader};
 use crate::proto::DeltaArchiveManifest;
+use crate::storage::write_all_at;
 use crate::style;
 
 use super::ZIP_MAGIC;
@@ -184,7 +184,8 @@ pub fn open_http_metadata(
         let hdr = range_download(&client, url, payload_off, HEADER_SIZE as u64).await?;
         let header = PayloadHeader::parse(&hdr)?;
 
-        let meta_len = (HEADER_SIZE as u64).checked_add(header.manifest_size)
+        let meta_len = (HEADER_SIZE as u64)
+            .checked_add(header.manifest_size)
             .and_then(|length| length.checked_add(header.metadata_signature_size as u64))
             .context("payload metadata length overflows")?;
         eprintln!(
@@ -373,7 +374,6 @@ pub fn open_http_extract(
     })
 }
 
-
 /// Download a byte range and stream it straight to `file` at `file_base` via
 /// positional writes — never buffering the whole range in memory. Increments
 /// `downloaded` per chunk for progress. Mirrors [`range_download`]'s retry and
@@ -413,7 +413,8 @@ async fn range_download_to_file(
             let mut written = 0u64;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("stream error")?;
-                write_all_at(file, &chunk, file_base + written).context("temp file write failed")?;
+                write_all_at(file, &chunk, file_base + written)
+                    .context("temp file write failed")?;
                 written += chunk.len() as u64;
                 downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }

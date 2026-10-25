@@ -28,15 +28,22 @@ pub(crate) fn plan_compact(
     payload_length: Option<u64>,
 ) -> Result<CompactPlan> {
     if let Some(length) = payload_length {
-        ensure!(metadata_length <= length, "payload metadata exceeds payload length");
+        ensure!(
+            metadata_length <= length,
+            "payload metadata exceeds payload length"
+        );
     }
     operations.retain(|&(_, length)| length != 0);
     for &(offset, length) in &operations {
-        let end = offset.checked_add(length)
+        let end = offset
+            .checked_add(length)
             .and_then(|end| metadata_length.checked_add(end))
             .ok_or_else(|| anyhow::anyhow!("operation data range overflows"))?;
         if let Some(payload_length) = payload_length {
-            ensure!(end <= payload_length, "operation data range exceeds payload length");
+            ensure!(
+                end <= payload_length,
+                "operation data range exceeds payload length"
+            );
         }
     }
     operations.sort_unstable();
@@ -59,27 +66,38 @@ pub(crate) fn plan_compact(
                 continue;
             }
         }
-        ranges.push(DownloadRange { data_offset: offset, length, file_offset: 0 });
+        ranges.push(DownloadRange {
+            data_offset: offset,
+            length,
+            file_offset: 0,
+        });
     }
     let mut total_size = metadata_length;
     for range in &mut ranges {
         range.file_offset = total_size;
-        total_size = total_size.checked_add(range.length)
+        total_size = total_size
+            .checked_add(range.length)
             .ok_or_else(|| anyhow::anyhow!("compact file length overflows"))?;
     }
     let mut remap = HashMap::with_capacity(operations.len());
     let mut range_index = 0;
     for (offset, length) in operations {
         while range_index < ranges.len()
-            && offset >= ranges[range_index].data_offset + ranges[range_index].length {
+            && offset >= ranges[range_index].data_offset + ranges[range_index].length
+        {
             range_index += 1;
         }
         let Some(range) = ranges.get(range_index) else {
             bail!("operation data is not covered by compact layout");
         };
-        ensure!(offset >= range.data_offset && offset + length <= range.data_offset + range.length,
-            "operation data is not covered by compact layout");
-        remap.insert(offset, (range.file_offset + (offset - range.data_offset), length));
+        ensure!(
+            offset >= range.data_offset && offset + length <= range.data_offset + range.length,
+            "operation data is not covered by compact layout"
+        );
+        remap.insert(
+            offset,
+            (range.file_offset + (offset - range.data_offset), length),
+        );
     }
     Ok(CompactPlan {
         total_size,
@@ -95,14 +113,31 @@ mod tests {
 
     #[test]
     fn overlapping_unsorted_and_duplicate_ranges_have_deterministic_layout() {
-        let plan = plan_compact(24, vec![(200, 30), (100, 10), (110, 40), (100, 50), (100, 10)], None).unwrap();
-        assert_eq!(plan.ranges, vec![DownloadRange { data_offset: 100, length: 130, file_offset: 24 }]);
+        let plan = plan_compact(
+            24,
+            vec![(200, 30), (100, 10), (110, 40), (100, 50), (100, 10)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.ranges,
+            vec![DownloadRange {
+                data_offset: 100,
+                length: 130,
+                file_offset: 24
+            }]
+        );
         assert_eq!(plan.total_size, 154);
         assert_eq!(plan.download_bytes, 130);
         assert_eq!(plan.remap[&100], (24, 50));
         assert_eq!(plan.remap[&110], (34, 40));
         assert_eq!(plan.remap[&200], (124, 30));
-        let reversed = plan_compact(24, vec![(100, 10), (100, 50), (110, 40), (100, 10), (200, 30)], None).unwrap();
+        let reversed = plan_compact(
+            24,
+            vec![(100, 10), (100, 50), (110, 40), (100, 10), (200, 30)],
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.ranges, reversed.ranges);
         assert_eq!(plan.remap, reversed.remap);
     }
@@ -142,7 +177,10 @@ mod tests {
         assert!(plan_compact(24, vec![(u64::MAX - 24, 1)], None).is_err());
         assert!(plan_compact(24, vec![(4, 2)], Some(29)).is_err());
         assert!(plan_compact(24, vec![], Some(23)).is_err());
-        assert_eq!(plan_compact(24, vec![(4, 2)], Some(30)).unwrap().total_size, 26);
+        assert_eq!(
+            plan_compact(24, vec![(4, 2)], Some(30)).unwrap().total_size,
+            26
+        );
         let edge = plan_compact(0, vec![(u64::MAX - 1, 1)], Some(u64::MAX)).unwrap();
         assert_eq!(edge.total_size, 1);
         let far = plan_compact(0, vec![(0, 8), (u64::MAX - 1, 1)], Some(u64::MAX)).unwrap();

@@ -20,9 +20,15 @@ pub(super) const SHA256_DIGEST_SIZE: usize = 32;
 
 pub(super) fn extent_range(extent: &Extent, block_size: u32) -> Result<Range<u64>> {
     let bs = u64::from(block_size);
-    let start = extent.start_block.unwrap_or(0).checked_mul(bs)
+    let start = extent
+        .start_block
+        .unwrap_or(0)
+        .checked_mul(bs)
         .context("extent offset overflow")?;
-    let size = extent.num_blocks.unwrap_or(0).checked_mul(bs)
+    let size = extent
+        .num_blocks
+        .unwrap_or(0)
+        .checked_mul(bs)
         .context("extent size overflow")?;
     Ok(start..start.checked_add(size).context("extent end overflow")?)
 }
@@ -44,7 +50,8 @@ pub(super) fn tree_layout(
     file_len: u64,
 ) -> Result<Option<Vec<TreeLevel>>> {
     let (data_extent, tree_extent) = match (
-        &partition.hash_tree_data_extent, &partition.hash_tree_extent,
+        &partition.hash_tree_data_extent,
+        &partition.hash_tree_extent,
     ) {
         (None, None) => return Ok(None),
         (Some(data), Some(tree)) => (data, tree),
@@ -77,19 +84,28 @@ pub(super) fn tree_layout(
     let mut sizes = Vec::new();
     let mut blocks = (data.end - data.start) / bs;
     loop {
-        let hashes = blocks.checked_mul(SHA256_DIGEST_SIZE as u64)
+        let hashes = blocks
+            .checked_mul(SHA256_DIGEST_SIZE as u64)
             .context("hash tree size overflow")?;
-        let size = hashes.div_ceil(bs).checked_mul(bs).context("hash tree size overflow")?;
+        let size = hashes
+            .div_ceil(bs)
+            .checked_mul(bs)
+            .context("hash tree size overflow")?;
         sizes.push(size);
         if size == bs {
             break;
         }
         blocks = size / bs;
     }
-    let total = sizes.iter().try_fold(0u64, |sum, size| sum.checked_add(*size))
+    let total = sizes
+        .iter()
+        .try_fold(0u64, |sum, size| sum.checked_add(*size))
         .context("hash tree size overflow")?;
     if total != tree.end - tree.start {
-        bail!("hash tree extent size mismatch: declared {}, computed {total}", tree.end - tree.start);
+        bail!(
+            "hash tree extent size mismatch: declared {}, computed {total}",
+            tree.end - tree.start
+        );
     }
     let mut levels = Vec::with_capacity(sizes.len());
     let mut input_offset = data.start;
@@ -97,7 +113,12 @@ pub(super) fn tree_layout(
     let mut output_end = tree.end;
     for size in sizes {
         let output_offset = output_end - size;
-        levels.push(TreeLevel { input_offset, input_blocks, output_offset, output_size: size });
+        levels.push(TreeLevel {
+            input_offset,
+            input_blocks,
+            output_offset,
+            output_size: size,
+        });
         input_offset = output_offset;
         input_blocks = size / bs;
         output_end = output_offset;
@@ -118,9 +139,15 @@ pub(super) fn hash_tree_block(
     output.fill(0);
     let hashes_per_block = block_size / SHA256_DIGEST_SIZE;
     let first = output_block * hashes_per_block as u64;
-    let count = level.input_blocks.saturating_sub(first).min(hashes_per_block as u64);
+    let count = level
+        .input_blocks
+        .saturating_sub(first)
+        .min(hashes_per_block as u64);
     for slot in 0..count {
-        read(scratch, level.input_offset + (first + slot) * block_size as u64)?;
+        read(
+            scratch,
+            level.input_offset + (first + slot) * block_size as u64,
+        )?;
         let mut hasher = Sha256::new();
         hasher.update(salt);
         hasher.update(&*scratch);
@@ -140,7 +167,10 @@ pub fn compute_and_write_hash_tree(
     if partition.hash_tree_data_extent.is_none() && partition.hash_tree_extent.is_none() {
         return Ok(false);
     }
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(output_path)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output_path)
         .with_context(|| format!("failed to open '{}' for hash tree", output_path.display()))?;
     let Some(levels) = tree_layout(partition, block_size, file.metadata()?.len())? else {
         return Ok(false);
@@ -150,14 +180,21 @@ pub fn compute_and_write_hash_tree(
     for level in &levels {
         let blocks = level.output_size / u64::from(block_size);
         let write_block = |buffers: &mut (Vec<u8>, Vec<u8>), block: u64| -> Result<()> {
-            hash_tree_block(level, block, bs, salt, &mut buffers.0, &mut buffers.1,
-                |buf, offset| read_exact_at(&file, buf, offset))?;
+            hash_tree_block(
+                level,
+                block,
+                bs,
+                salt,
+                &mut buffers.0,
+                &mut buffers.1,
+                |buf, offset| read_exact_at(&file, buf, offset),
+            )?;
             write_all_at(&file, &buffers.1, level.output_offset + block * bs as u64)?;
             Ok(())
         };
-        (0..blocks).into_par_iter().try_for_each_init(
-            || (vec![0u8; bs], vec![0u8; bs]), write_block,
-        )?;
+        (0..blocks)
+            .into_par_iter()
+            .try_for_each_init(|| (vec![0u8; bs], vec![0u8; bs]), write_block)?;
     }
     Ok(true)
 }
@@ -191,10 +228,15 @@ pub(super) fn fec_layout(
     let parity = extent_range(parity_extent, block_size)?;
     let symbols = FEC_RSM - roots;
     let rounds = ((data.end - data.start) / FEC_BLOCKSIZE).div_ceil(u64::from(symbols));
-    let size = rounds.checked_mul(u64::from(roots)).and_then(|n| n.checked_mul(FEC_BLOCKSIZE))
+    let size = rounds
+        .checked_mul(u64::from(roots))
+        .and_then(|n| n.checked_mul(FEC_BLOCKSIZE))
         .context("FEC size overflow")?;
     if size != parity.end - parity.start {
-        bail!("FEC extent size mismatch: declared {}, computed {size}", parity.end - parity.start);
+        bail!(
+            "FEC extent size mismatch: declared {}, computed {size}",
+            parity.end - parity.start
+        );
     }
     if data.end > file_len || parity.end > file_len {
         bail!("FEC extents exceed partition size");
@@ -205,7 +247,13 @@ pub(super) fn fec_layout(
     if data.is_empty() {
         return Ok(None);
     }
-    Ok(Some(FecLayout { data, parity, rounds, roots: roots as usize, symbols: symbols as usize }))
+    Ok(Some(FecLayout {
+        data,
+        parity,
+        rounds,
+        roots: roots as usize,
+        symbols: symbols as usize,
+    }))
 }
 
 /// One reusable Android FEC round (at most 255 * 4096 bytes).
@@ -235,8 +283,10 @@ impl FecBuffers {
         let data_blocks = (layout.data.end - layout.data.start) / FEC_BLOCKSIZE;
         for symbol in 0..layout.symbols {
             // Equivalent to Android fec_ecc_interleave(round * rsn * bs + symbol).
-            let block = (symbol as u64).checked_mul(layout.rounds)
-                .and_then(|n| n.checked_add(round)).context("FEC interleave overflow")?;
+            let block = (symbol as u64)
+                .checked_mul(layout.rounds)
+                .and_then(|n| n.checked_add(round))
+                .context("FEC interleave overflow")?;
             if block < data_blocks {
                 read(&mut self.block, layout.data.start + block * FEC_BLOCKSIZE)?;
             } else {
@@ -246,7 +296,9 @@ impl FecBuffers {
                 self.columns[column * layout.symbols + symbol] = byte;
             }
         }
-        for (data, parity) in self.columns.chunks_exact(layout.symbols)
+        for (data, parity) in self
+            .columns
+            .chunks_exact(layout.symbols)
             .zip(self.parity.chunks_exact_mut(layout.roots))
         {
             self.encoder.encode(data, parity);
@@ -264,18 +316,29 @@ pub fn compute_and_write_fec(
     if partition.fec_data_extent.is_none() && partition.fec_extent.is_none() {
         return Ok(false);
     }
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(output_path)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(output_path)
         .with_context(|| format!("failed to open '{}' for FEC", output_path.display()))?;
     let Some(layout) = fec_layout(partition, block_size, file.metadata()?.len())? else {
         return Ok(false);
     };
     let write_round = |buffers: &mut Result<FecBuffers>, round: u64| -> Result<()> {
         let buffers = buffers.as_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
-        buffers.encode(&layout, round, |buf, offset| read_exact_at(&file, buf, offset))?;
-        write_all_at(&file, &buffers.parity, layout.parity.start + round * buffers.parity.len() as u64)?;
+        buffers.encode(&layout, round, |buf, offset| {
+            read_exact_at(&file, buf, offset)
+        })?;
+        write_all_at(
+            &file,
+            &buffers.parity,
+            layout.parity.start + round * buffers.parity.len() as u64,
+        )?;
         Ok(())
     };
-    (0..layout.rounds).into_par_iter().try_for_each_init(|| FecBuffers::new(&layout), write_round)?;
+    (0..layout.rounds)
+        .into_par_iter()
+        .try_for_each_init(|| FecBuffers::new(&layout), write_round)?;
     Ok(true)
 }
 
@@ -294,7 +357,9 @@ pub fn verify_update_partitions(
     }
     let update = |partition: &&PartitionUpdate| -> Result<()> {
         let name = &partition.partition_name;
-        let output_path = out_config.and_then(|paths| paths.get(name)).cloned()
+        let output_path = out_config
+            .and_then(|paths| paths.get(name))
+            .cloned()
             .unwrap_or_else(|| output_dir.join(format!("{name}.img")));
         if !std::fs::exists(&output_path)? {
             if !quiet {
@@ -312,11 +377,15 @@ pub fn verify_update_partitions(
         Ok(())
     };
     let thread_count = if threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     } else {
         threads
     };
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_count).build()
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
         .context("failed to create thread pool")?;
     pool.install(|| partitions.par_iter().try_for_each(update))
 }

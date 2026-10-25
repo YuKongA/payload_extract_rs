@@ -1,7 +1,7 @@
 pub mod local;
-pub mod zip_input;
 #[cfg(any(test, feature = "http"))]
 pub(crate) mod ranges;
+pub mod zip_input;
 
 #[cfg(feature = "http")]
 pub mod http;
@@ -58,7 +58,10 @@ pub enum PartitionFilter {
 
 impl PartitionFilter {
     /// Partitions matching this filter; an explicit filter matching nothing is an error.
-    pub fn select<'a>(&self, partitions: &'a [PartitionUpdate]) -> Result<Vec<&'a PartitionUpdate>> {
+    pub fn select<'a>(
+        &self,
+        partitions: &'a [PartitionUpdate],
+    ) -> Result<Vec<&'a PartitionUpdate>> {
         let selected: Vec<&PartitionUpdate> = partitions
             .iter()
             .filter(|partition| match self {

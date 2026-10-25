@@ -12,9 +12,11 @@ use crate::payload::PayloadView;
 /// Ordinary OTA ZIPs start at zero. Avoid zip's default whole-file offset scan,
 /// but retain automatic detection for archives with a prepended stub.
 fn open_archive<R: Read + Seek>(mut reader: R) -> zip::result::ZipResult<zip::ZipArchive<R>> {
-    let config = zip::read::Config { archive_offset: zip::read::ArchiveOffset::Known(0) };
-    let metadata = zip::ZipArchive::with_config(config, &mut reader)
-        .map(|archive| archive.metadata());
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let metadata =
+        zip::ZipArchive::with_config(config, &mut reader).map(|archive| archive.metadata());
     match metadata {
         Ok(metadata) => {
             // SAFETY: this is the exact reader from which the metadata was just
@@ -110,7 +112,6 @@ pub fn read_ota_metadata_from_mmap(mmap: &Mmap) -> Result<OtaMetadataData> {
     Ok(data)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,7 +129,8 @@ mod tests {
 
     impl Read for Archive {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let count = (self.length.saturating_sub(self.position)).min(buffer.len() as u64) as usize;
+            let count =
+                (self.length.saturating_sub(self.position)).min(buffer.len() as u64) as usize;
             let end = self.position + count as u64;
             if count > 0 && self.position < self.forbidden.end && end > self.forbidden.start {
                 return Err(io::Error::other("ZIP opening read unrelated payload data"));
@@ -169,23 +171,41 @@ mod tests {
             extra.extend_from_slice(&size.to_le_bytes());
         }
         let version: u16 = if zip64 { 45 } else { 20 };
-        let size32 = if zip64 { u32::MAX } else { u32::try_from(size).unwrap() };
+        let size32 = if zip64 {
+            u32::MAX
+        } else {
+            u32::try_from(size).unwrap()
+        };
         let mut local = 0x04034b50u32.to_le_bytes().to_vec();
-        for value in [version, 0, 0, 0, 0] { local.extend_from_slice(&value.to_le_bytes()); }
+        for value in [version, 0, 0, 0, 0] {
+            local.extend_from_slice(&value.to_le_bytes());
+        }
         // CRC32 of "123456789"; large fixtures only read raw bytes, not CRC.
         local.extend_from_slice(&0xcbf43926u32.to_le_bytes());
-        for value in [size32, size32] { local.extend_from_slice(&value.to_le_bytes()); }
-        for value in [name.len() as u16, extra.len() as u16] { local.extend_from_slice(&value.to_le_bytes()); }
+        for value in [size32, size32] {
+            local.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [name.len() as u16, extra.len() as u16] {
+            local.extend_from_slice(&value.to_le_bytes());
+        }
         local.extend_from_slice(name);
         local.extend_from_slice(&extra);
         let data_start = local.len() as u64;
         let directory_start = data_start + size;
 
         let mut directory = 0x02014b50u32.to_le_bytes().to_vec();
-        for value in [version, version, 0, 0, 0, 0] { directory.extend_from_slice(&value.to_le_bytes()); }
-        for value in [0xcbf43926, size32, size32] { directory.extend_from_slice(&value.to_le_bytes()); }
-        for value in [name.len() as u16, extra.len() as u16, 0, 0, 0] { directory.extend_from_slice(&value.to_le_bytes()); }
-        for value in [0u32, 0] { directory.extend_from_slice(&value.to_le_bytes()); }
+        for value in [version, version, 0, 0, 0, 0] {
+            directory.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0xcbf43926, size32, size32] {
+            directory.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [name.len() as u16, extra.len() as u16, 0, 0, 0] {
+            directory.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0u32, 0] {
+            directory.extend_from_slice(&value.to_le_bytes());
+        }
         directory.extend_from_slice(name);
         directory.extend_from_slice(&extra);
         let directory_size = directory.len() as u64;
@@ -193,9 +213,15 @@ mod tests {
             let eocd64_offset = directory_start + directory_size;
             directory.extend_from_slice(&0x06064b50u32.to_le_bytes());
             directory.extend_from_slice(&44u64.to_le_bytes());
-            for value in [version, version] { directory.extend_from_slice(&value.to_le_bytes()); }
-            for value in [0u32, 0] { directory.extend_from_slice(&value.to_le_bytes()); }
-            for value in [1u64, 1, directory_size, directory_start] { directory.extend_from_slice(&value.to_le_bytes()); }
+            for value in [version, version] {
+                directory.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [0u32, 0] {
+                directory.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [1u64, 1, directory_size, directory_start] {
+                directory.extend_from_slice(&value.to_le_bytes());
+            }
             directory.extend_from_slice(&0x07064b50u32.to_le_bytes());
             directory.extend_from_slice(&0u32.to_le_bytes());
             directory.extend_from_slice(&eocd64_offset.to_le_bytes());
@@ -203,20 +229,37 @@ mod tests {
         }
         directory.extend_from_slice(&0x06054b50u32.to_le_bytes());
         let count: u16 = if zip64 { u16::MAX } else { 1 };
-        for value in [0u16, 0, count, count] { directory.extend_from_slice(&value.to_le_bytes()); }
+        for value in [0u16, 0, count, count] {
+            directory.extend_from_slice(&value.to_le_bytes());
+        }
         directory.extend_from_slice(&(directory_size as u32).to_le_bytes());
-        directory.extend_from_slice(&(if zip64 { u32::MAX } else { directory_start as u32 }).to_le_bytes());
+        directory.extend_from_slice(
+            &(if zip64 {
+                u32::MAX
+            } else {
+                directory_start as u32
+            })
+            .to_le_bytes(),
+        );
         directory.extend_from_slice(&0u16.to_le_bytes());
 
         let base = prefix.len() as u64;
         let length = base + directory_start + directory.len() as u64;
         let forbidden = base + data_start + 9..length.saturating_sub(65557);
-        (Archive {
-            segments: vec![(0, prefix.to_vec()), (base, local), (base + data_start, b"123456789".to_vec()), (base + directory_start, directory)],
-            position: 0,
-            length,
-            forbidden,
-        }, base + data_start)
+        (
+            Archive {
+                segments: vec![
+                    (0, prefix.to_vec()),
+                    (base, local),
+                    (base + data_start, b"123456789".to_vec()),
+                    (base + directory_start, directory),
+                ],
+                position: 0,
+                length,
+                forbidden,
+            },
+            base + data_start,
+        )
     }
 
     #[test]

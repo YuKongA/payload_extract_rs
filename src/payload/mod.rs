@@ -1,7 +1,7 @@
 pub mod header;
 
-use std::io;
 use std::collections::HashMap;
+use std::io;
 
 use memmap2::Mmap;
 use prost::Message;
@@ -91,8 +91,10 @@ impl PayloadView {
         let header = PayloadHeader::parse(slice)?;
 
         let manifest_start = HEADER_SIZE;
-        let manifest_end = usize::try_from(header.manifest_size).ok()
-            .and_then(|size| manifest_start.checked_add(size)).ok_or_else(invalid_range)?;
+        let manifest_end = usize::try_from(header.manifest_size)
+            .ok()
+            .and_then(|size| manifest_start.checked_add(size))
+            .ok_or_else(invalid_range)?;
 
         if slice.len() < manifest_end {
             return Err(PayloadError::PayloadTooSmall {
@@ -102,7 +104,9 @@ impl PayloadView {
         }
 
         let manifest = DeltaArchiveManifest::decode(&slice[manifest_start..manifest_end])?;
-        let data_offset = (manifest_end as u64).checked_add(header.metadata_signature_size as u64).ok_or_else(invalid_range)?;
+        let data_offset = (manifest_end as u64)
+            .checked_add(header.metadata_signature_size as u64)
+            .ok_or_else(invalid_range)?;
 
         // Advise the kernel about sequential access pattern for better readahead
         #[cfg(unix)]
@@ -174,14 +178,21 @@ impl PayloadView {
             }
             Ok(position)
         } else {
-            self.payload_offset.checked_add(self.data_offset)
-                .and_then(|offset| offset.checked_add(data_offset)).ok_or_else(invalid_range)
+            self.payload_offset
+                .checked_add(self.data_offset)
+                .and_then(|offset| offset.checked_add(data_offset))
+                .ok_or_else(invalid_range)
         }
     }
 
     /// A bounded reader over one operation, independent of the OTA's total size.
-    pub fn blob_reader_raw(&self, data_offset: u64, data_length: u64) -> Result<io::Cursor<&[u8]>, PayloadError> {
-        self.blob_slice_raw(data_offset, data_length).map(io::Cursor::new)
+    pub fn blob_reader_raw(
+        &self,
+        data_offset: u64,
+        data_length: u64,
+    ) -> Result<io::Cursor<&[u8]>, PayloadError> {
+        self.blob_slice_raw(data_offset, data_length)
+            .map(io::Cursor::new)
     }
 
     fn read_range(&self, start: u64, length: u64) -> Result<&[u8], PayloadError> {
@@ -226,7 +237,10 @@ impl PayloadView {
 
     #[allow(dead_code)]
     pub fn payload_signatures_bytes(&self) -> Result<Option<&[u8]>, PayloadError> {
-        let (Some(offset), Some(size)) = (self.manifest.signatures_offset, self.manifest.signatures_size) else {
+        let (Some(offset), Some(size)) = (
+            self.manifest.signatures_offset,
+            self.manifest.signatures_size,
+        ) else {
             return Ok(None);
         };
         self.blob_slice_raw(offset, size).map(Some)
@@ -234,9 +248,12 @@ impl PayloadView {
 }
 
 fn invalid_range() -> PayloadError {
-    io::Error::new(io::ErrorKind::InvalidData, "payload range is truncated, too large, or overflows").into()
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "payload range is truncated, too large, or overflows",
+    )
+    .into()
 }
-
 
 // tempfile is only available under the `http` feature.
 #[cfg(all(test, feature = "http"))]
@@ -308,8 +325,14 @@ mod local_tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let dir = crate::storage::test_dir().join(format!("payload-ranges-{stamp}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = crate::storage::test_dir().join(format!(
+                "payload-ranges-{stamp}-{}",
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&dir).unwrap();
             let mut bytes = b"CrAU".to_vec();
             bytes.extend_from_slice(&2u64.to_be_bytes());
@@ -361,7 +384,10 @@ mod local_tests {
         view.manifest.signatures_size = Some(3);
         let signatures: &[u8] = view.payload_signatures_bytes().unwrap().unwrap();
         assert_eq!(signatures, b"XYZ");
-        assert_eq!(signatures.as_ptr(), view.blob_slice_raw(3, 3).unwrap().as_ptr());
+        assert_eq!(
+            signatures.as_ptr(),
+            view.blob_slice_raw(3, 3).unwrap().as_ptr()
+        );
         view.manifest.signatures_size = Some(4);
         assert!(view.payload_signatures_bytes().is_err());
     }
@@ -374,6 +400,12 @@ mod local_tests {
             assert!(view.blob_slice_raw(offset, length).is_err());
             assert!(view.blob_reader_raw(offset, length).is_err());
         }
-        assert_eq!(view.blob_reader_raw(6, 0).unwrap().read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(
+            view.blob_reader_raw(6, 0)
+                .unwrap()
+                .read(&mut [0; 1])
+                .unwrap(),
+            0
+        );
     }
 }

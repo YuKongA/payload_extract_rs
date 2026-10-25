@@ -213,7 +213,10 @@ mod tests {
     fn missing_images_fail_when_named() {
         let summary = summarize(&[Outcome::Verified, Outcome::Missing]);
         let err = validate(&summary, true, Path::new("out")).unwrap_err();
-        assert_eq!(err.to_string(), "missing images for 1 partition(s) in 'out'");
+        assert_eq!(
+            err.to_string(),
+            "missing images for 1 partition(s) in 'out'"
+        );
     }
 
     #[test]

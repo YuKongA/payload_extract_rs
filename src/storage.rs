@@ -33,14 +33,20 @@ impl ReadOnlyFile {
     pub fn read_range(&self, offset: u64, length: usize) -> io::Result<&[u8]> {
         self.check_range(offset, length)?;
         let start = usize::try_from(offset).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds address space")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file offset exceeds address space",
+            )
         })?;
         let bytes = self.mapping.as_deref().unwrap_or(&[]);
         Ok(&bytes[start..start + length])
     }
 
     fn check_range(&self, offset: u64, length: usize) -> io::Result<()> {
-        if offset.checked_add(length as u64).is_none_or(|end| end > self.len) {
+        if offset
+            .checked_add(length as u64)
+            .is_none_or(|end| end > self.len)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "requested range exceeds file length",
@@ -64,7 +70,12 @@ pub(crate) fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) ->
             file.seek_read(buf, offset)
         };
         match result {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short file read")),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "short file read",
+                ));
+            }
             Ok(n) => {
                 offset = offset.checked_add(n as u64).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
@@ -127,7 +138,10 @@ mod tests {
         storage.read_exact_at(&mut bytes, 7).unwrap();
         assert_eq!(&bytes, b"789");
         assert!(storage.read_range(10, 0).unwrap().is_empty());
-        assert_eq!(storage.read_range(9, 2).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            storage.read_range(9, 2).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         assert!(storage.read_range(u64::MAX, 2).is_err());
         drop(storage);
         std::fs::remove_file(path).unwrap();
@@ -137,13 +151,21 @@ mod tests {
     fn positional_helpers_write_and_report_short_reads() {
         let path = test_dir().join("pe_storage_positions.bin");
         let file = std::fs::OpenOptions::new()
-            .create(true).truncate(true).read(true).write(true).open(&path).unwrap();
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         write_all_at(&file, b"xyz", 4).unwrap();
         write_all_at(&file, b"ab", 0).unwrap();
         let mut bytes = [0; 7];
         read_exact_at(&file, &mut bytes, 0).unwrap();
         assert_eq!(&bytes, b"ab\0\0xyz");
-        assert_eq!(read_exact_at(&file, &mut bytes, 1).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            read_exact_at(&file, &mut bytes, 1).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         drop(file);
         std::fs::remove_file(path).unwrap();
     }

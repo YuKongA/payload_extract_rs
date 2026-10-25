@@ -61,16 +61,23 @@ pub fn extract_partitions(
     config: &ExtractConfig,
 ) -> Result<()> {
     let partitions = payload.selected_partitions(partition_names);
-    extract_selected(payload, &partitions, config, |part_name, part_size, block_size| {
-        let output_path = config.out_config.as_ref()
-            .and_then(|paths| paths.get(part_name))
-            .cloned()
-            .unwrap_or_else(|| output_dir.join(format!("{part_name}.img")));
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Ok(PartitionWriter::new(&output_path, part_size, block_size)?)
-    })
+    extract_selected(
+        payload,
+        &partitions,
+        config,
+        |part_name, part_size, block_size| {
+            let output_path = config
+                .out_config
+                .as_ref()
+                .and_then(|paths| paths.get(part_name))
+                .cloned()
+                .unwrap_or_else(|| output_dir.join(format!("{part_name}.img")));
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(PartitionWriter::new(&output_path, part_size, block_size)?)
+        },
+    )
 }
 
 /// Extract one partition into an already-open writable, seekable file.
@@ -82,7 +89,9 @@ pub fn extract_partition_to_file(
     partition_name: &str,
     config: &ExtractConfig,
 ) -> Result<()> {
-    let partition = payload.partitions().iter()
+    let partition = payload
+        .partitions()
+        .iter()
         .find(|partition| partition.partition_name == partition_name)
         .with_context(|| format!("partition not found: {partition_name}"))?;
     extract_selected(payload, &[partition], config, |_, part_size, block_size| {
@@ -136,124 +145,127 @@ fn extract_selected(
             .progress_chars("=> ");
 
     let extract_partition = |partition: &&crate::proto::PartitionUpdate| -> Result<()> {
-                let part_name = &partition.partition_name;
+        let part_name = &partition.partition_name;
 
-                // Determine partition size
-                let part_size = if let Some(size) = partition
-                    .new_partition_info
-                    .as_ref()
-                    .and_then(|info| info.size)
-                {
-                    size
-                } else {
-                    partition.operations.iter().try_fold(0, |size, op| {
-                        op.dst_extents.iter().try_fold(size, |size, extent| {
-                            let start = extent.start_block.unwrap_or(0);
-                            if start == u64::MAX {
-                                return Ok::<u64, anyhow::Error>(size);
-                            }
-                            let end = start.checked_add(extent.num_blocks.unwrap_or(0))
-                                .and_then(|end| end.checked_mul(block_size as u64))
-                                .context("destination extent size overflow")?;
-                            Ok(size.max(end))
-                        })
-                    })?
-                };
-
-                let writer = make_writer(part_name, part_size, block_size)?;
-
-                // Open source partition for delta OTA if needed
-                let source_file = if let Some(source_dir) = &config.source_dir {
-                    let src_path = Path::new(source_dir).join(format!("{part_name}.img"));
-                    if std::fs::exists(&src_path)? {
-                        Some(ReadOnlyFile::open(&src_path)?)
-                    } else {
-                        None
+        // Determine partition size
+        let part_size = if let Some(size) = partition
+            .new_partition_info
+            .as_ref()
+            .and_then(|info| info.size)
+        {
+            size
+        } else {
+            partition.operations.iter().try_fold(0, |size, op| {
+                op.dst_extents.iter().try_fold(size, |size, extent| {
+                    let start = extent.start_block.unwrap_or(0);
+                    if start == u64::MAX {
+                        return Ok::<u64, anyhow::Error>(size);
                     }
-                } else {
-                    None
-                };
+                    let end = start
+                        .checked_add(extent.num_blocks.unwrap_or(0))
+                        .and_then(|end| end.checked_mul(block_size as u64))
+                        .context("destination extent size overflow")?;
+                    Ok(size.max(end))
+                })
+            })?
+        };
 
-                // Build operation tasks
-                let mut tasks: Vec<OperationTask> = Vec::with_capacity(partition.operations.len());
-                for op in &partition.operations {
-                    let op_type_raw = op.r#type();
-                    let op_type = OpType::from_proto(op_type_raw).map_err(|_| {
-                        crate::error::PayloadError::UnsupportedOperation(op_type_raw as i32)
-                    })?;
+        let writer = make_writer(part_name, part_size, block_size)?;
 
-                    let src_extents: Vec<(u64, u64)> = op
-                        .src_extents
-                        .iter()
-                        .map(|e| (e.start_block.unwrap_or(0), e.num_blocks.unwrap_or(0)))
-                        .collect();
+        // Open source partition for delta OTA if needed
+        let source_file = if let Some(source_dir) = &config.source_dir {
+            let src_path = Path::new(source_dir).join(format!("{part_name}.img"));
+            if std::fs::exists(&src_path)? {
+                Some(ReadOnlyFile::open(&src_path)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-                    let dst_extents: Vec<(u64, u64)> = op
-                        .dst_extents
-                        .iter()
-                        .map(|e| (e.start_block.unwrap_or(0), e.num_blocks.unwrap_or(0)))
-                        .collect();
+        // Build operation tasks
+        let mut tasks: Vec<OperationTask> = Vec::with_capacity(partition.operations.len());
+        for op in &partition.operations {
+            let op_type_raw = op.r#type();
+            let op_type = OpType::from_proto(op_type_raw).map_err(|_| {
+                crate::error::PayloadError::UnsupportedOperation(op_type_raw as i32)
+            })?;
 
-                    tasks.push(OperationTask {
-                        op_type,
-                        data_offset: op.data_offset.unwrap_or(0),
-                        data_length: op.data_length.unwrap_or(0),
-                        src_extents,
-                        dst_extents,
-                        data_sha256: op.data_sha256_hash.clone(),
-                    });
-                }
+            let src_extents: Vec<(u64, u64)> = op
+                .src_extents
+                .iter()
+                .map(|e| (e.start_block.unwrap_or(0), e.num_blocks.unwrap_or(0)))
+                .collect();
 
-                // Sort by data_offset for sequential payload reads
-                tasks.sort_by_key(|t| t.data_offset);
+            let dst_extents: Vec<(u64, u64)> = op
+                .dst_extents
+                .iter()
+                .map(|e| (e.start_block.unwrap_or(0), e.num_blocks.unwrap_or(0)))
+                .collect();
 
-                // Setup progress bar
-                let pb = if !config.quiet {
-                    let pb = multi_progress.add(ProgressBar::new(tasks.len() as u64));
-                    pb.set_style(progress_style.clone());
-                    pb.set_prefix(style::bold().apply_to(part_name).to_string());
-                    pb.set_message(style::format_size(part_size));
-                    Some(pb)
-                } else {
-                    None
-                };
+            tasks.push(OperationTask {
+                op_type,
+                data_offset: op.data_offset.unwrap_or(0),
+                data_length: op.data_length.unwrap_or(0),
+                src_extents,
+                dst_extents,
+                data_sha256: op.data_sha256_hash.clone(),
+            });
+        }
 
-                let completed = AtomicU64::new(0);
-                let total_ops = tasks.len() as u64;
+        // Sort by data_offset for sequential payload reads
+        tasks.sort_by_key(|t| t.data_offset);
 
-                let process_task = |task: &OperationTask| -> Result<()> {
-                    process_operation(
-                        payload,
-                        task,
-                        &writer,
-                        block_size,
-                        config,
-                        source_file.as_ref(),
-                    )?;
+        // Setup progress bar
+        let pb = if !config.quiet {
+            let pb = multi_progress.add(ProgressBar::new(tasks.len() as u64));
+            pb.set_style(progress_style.clone());
+            pb.set_prefix(style::bold().apply_to(part_name).to_string());
+            pb.set_message(style::format_size(part_size));
+            Some(pb)
+        } else {
+            None
+        };
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(pb) = &pb {
-                        pb.set_position(done);
-                    }
-                    // Report progress regardless of `quiet` — headless callers
-                    // (GUI) set quiet=true but still consume the callback.
-                    if let Some(cb) = &config.progress {
-                        cb(done, total_ops);
-                    }
+        let completed = AtomicU64::new(0);
+        let total_ops = tasks.len() as u64;
 
-                    Ok(())
-                };
-                tasks.par_iter().try_for_each(process_task)?;
+        let process_task = |task: &OperationTask| -> Result<()> {
+            process_operation(
+                payload,
+                task,
+                &writer,
+                block_size,
+                config,
+                source_file.as_ref(),
+            )?;
 
-                if let Some(pb) = &pb {
-                    pb.finish();
-                }
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(pb) = &pb {
+                pb.set_position(done);
+            }
+            // Report progress regardless of `quiet` — headless callers
+            // (GUI) set quiet=true but still consume the callback.
+            if let Some(cb) = &config.progress {
+                cb(done, total_ops);
+            }
 
-                Ok(())
+            Ok(())
+        };
+        tasks.par_iter().try_for_each(process_task)?;
+
+        if let Some(pb) = &pb {
+            pb.finish();
+        }
+
+        Ok(())
     };
 
     let thread_count = if config.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     } else {
         config.threads
     };
@@ -298,7 +310,13 @@ fn process_operation(
         OpType::SourceCopy => {
             let src = source_data
                 .ok_or_else(|| anyhow::anyhow!("SOURCE_COPY requires source partition data"))?;
-            copy_source_extents(src, &task.src_extents, &task.dst_extents, writer, block_size)?;
+            copy_source_extents(
+                src,
+                &task.src_extents,
+                &task.dst_extents,
+                writer,
+                block_size,
+            )?;
         }
         OpType::SourceBsdiff | OpType::BrotliBsdiff => {
             // BSDIFF40 (bz2) / BSDF2 (brotli) are both magic-prefixed bsdiff
@@ -310,16 +328,13 @@ fn process_operation(
             if config.verify_ops {
                 verify::verify_sha256(blob, &task.data_sha256)?;
             }
-            bufpool::with_extent_buffer(
-                0,
-                |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf)?;
-                    let mut patched = Vec::new();
-                    bsdiff_android::patch_bsdf2(buf, blob, &mut patched)
-                        .map_err(|e| anyhow::anyhow!("{:?} patch failed: {e}", task.op_type))?;
-                    write_to_extents(&patched, &task.dst_extents, writer, block_size)
-                },
-            )?;
+            bufpool::with_extent_buffer(0, |buf| {
+                read_from_extents(src, &task.src_extents, block_size, buf)?;
+                let mut patched = Vec::new();
+                bsdiff_android::patch_bsdf2(buf, blob, &mut patched)
+                    .map_err(|e| anyhow::anyhow!("{:?} patch failed: {e}", task.op_type))?;
+                write_to_extents(&patched, &task.dst_extents, writer, block_size)
+            })?;
         }
         OpType::Puffdiff => {
             bail!(
@@ -343,14 +358,11 @@ fn process_operation(
             if config.verify_ops {
                 verify::verify_sha256(blob, &task.data_sha256)?;
             }
-            bufpool::with_extent_buffer(
-                0,
-                |buf| {
-                    read_from_extents(src, &task.src_extents, block_size, buf)?;
-                    let patched = lz4diff::apply_lz4diff(buf, blob, task.op_type)?;
-                    write_to_extents(&patched, &task.dst_extents, writer, block_size)
-                },
-            )?;
+            bufpool::with_extent_buffer(0, |buf| {
+                read_from_extents(src, &task.src_extents, block_size, buf)?;
+                let patched = lz4diff::apply_lz4diff(buf, blob, task.op_type)?;
+                write_to_extents(&patched, &task.dst_extents, writer, block_size)
+            })?;
         }
     }
 
@@ -368,7 +380,10 @@ fn verify_blob(payload: &PayloadView, task: &OperationTask) -> Result<()> {
     if task.data_sha256.is_none() {
         return Ok(());
     }
-    Ok(verify::verify_sha256(get_blob(payload, task)?, &task.data_sha256)?)
+    Ok(verify::verify_sha256(
+        get_blob(payload, task)?,
+        &task.data_sha256,
+    )?)
 }
 
 fn stream_to_extents(reader: &mut impl Read, sink: &mut ExtentWriter<'_>) -> Result<()> {
@@ -396,7 +411,8 @@ fn stream_to_extents(reader: &mut impl Read, sink: &mut ExtentWriter<'_>) -> Res
 
 fn extents_byte_size(extents: &[(u64, u64)], block_size: u32) -> Result<usize> {
     let size = extents.iter().try_fold(0u64, |total, &(_, blocks)| {
-        blocks.checked_mul(block_size as u64)
+        blocks
+            .checked_mul(block_size as u64)
             .and_then(|length| total.checked_add(length))
             .context("source extent size overflow")
     })?;
@@ -413,17 +429,22 @@ fn read_from_extents(
 ) -> Result<()> {
     let size = extents_byte_size(extents, block_size)?;
     buffer.clear();
-    buffer.try_reserve(size).context("source extent allocation failed")?;
+    buffer
+        .try_reserve(size)
+        .context("source extent allocation failed")?;
     buffer.resize(size, 0);
     let mut position = 0;
     for &(start, blocks) in extents {
-        let length = blocks.checked_mul(block_size as u64)
+        let length = blocks
+            .checked_mul(block_size as u64)
             .and_then(|length| usize::try_from(length).ok())
             .context("source extent size overflow")?;
         if start != u64::MAX {
-            let offset = start.checked_mul(block_size as u64)
+            let offset = start
+                .checked_mul(block_size as u64)
                 .context("source extent offset overflow")?;
-            source.read_exact_at(&mut buffer[position..position + length], offset)
+            source
+                .read_exact_at(&mut buffer[position..position + length], offset)
                 .context("source extent is truncated or unreadable")?;
         }
         position += length;
@@ -443,12 +464,19 @@ fn copy_source_extents(
     DECODE_CHUNK.with(|cell| -> Result<()> {
         let mut buffer = cell.borrow_mut();
         for &(start, blocks) in extents {
-            let length = blocks.checked_mul(block_size as u64)
+            let length = blocks
+                .checked_mul(block_size as u64)
                 .context("source extent size overflow")?;
-            let offset = if start == u64::MAX { 0 } else {
-                let offset = start.checked_mul(block_size as u64)
+            let offset = if start == u64::MAX {
+                0
+            } else {
+                let offset = start
+                    .checked_mul(block_size as u64)
                     .context("source extent offset overflow")?;
-                if offset.checked_add(length).is_none_or(|end| end > source.len()) {
+                if offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > source.len())
+                {
                     bail!("source extent is truncated");
                 }
                 offset
@@ -512,7 +540,8 @@ impl<'a> ExtentWriter<'a> {
                 break; // output exceeds extent capacity; drop the remainder
             }
             let (start_block, num_blocks) = self.extents[self.idx];
-            let capacity = num_blocks.checked_mul(self.block_size)
+            let capacity = num_blocks
+                .checked_mul(self.block_size)
                 .context("destination extent size overflow")?;
             if self.pos_in_extent >= capacity {
                 self.idx += 1;
@@ -522,7 +551,8 @@ impl<'a> ExtentWriter<'a> {
             let remaining = capacity - self.pos_in_extent;
             let n = (data.len() as u64).min(remaining) as usize;
             if start_block != u64::MAX {
-                let offset = start_block.checked_mul(self.block_size)
+                let offset = start_block
+                    .checked_mul(self.block_size)
                     .and_then(|offset| offset.checked_add(self.pos_in_extent))
                     .context("destination extent offset overflow")?;
                 self.writer.write_at(&data[..n], offset)?;
@@ -562,15 +592,22 @@ mod stream_tests {
         let source = ReadOnlyFile::open(&source_path).unwrap();
         let writer = PartitionWriter::new(&output_path, bytes.len() as u64 + 3, 1).unwrap();
         copy_source_extents(
-            &source, &[(0, bytes.len() as u64), (u64::MAX, 3)],
-            &[(0, 5), (5, bytes.len() as u64 - 2)], &writer, 1,
-        ).unwrap();
+            &source,
+            &[(0, bytes.len() as u64), (u64::MAX, 3)],
+            &[(0, 5), (5, bytes.len() as u64 - 2)],
+            &writer,
+            1,
+        )
+        .unwrap();
         drop(writer);
         let actual = std::fs::read(&output_path).unwrap();
         assert_eq!(&actual[..bytes.len()], &bytes);
         assert_eq!(&actual[bytes.len()..], &[0, 0, 0]);
         let writer = PartitionWriter::new(&output_path, 4, 1).unwrap();
-        assert!(copy_source_extents(&source, &[(bytes.len() as u64, 1)], &[(0, 1)], &writer, 1).is_err());
+        assert!(
+            copy_source_extents(&source, &[(bytes.len() as u64, 1)], &[(0, 1)], &writer, 1)
+                .is_err()
+        );
         drop(writer);
         drop(source);
         std::fs::remove_file(source_path).unwrap();
@@ -584,7 +621,9 @@ mod stream_tests {
         let bs = 4096u32;
         let extents = vec![(2u64, 3u64), (10, 1), (20, 2)]; // non-contiguous
         let total = (3 + 1 + 2) * bs as usize;
-        let data: Vec<u8> = (0..total).map(|i| (i.wrapping_mul(7).wrapping_add(3)) as u8).collect();
+        let data: Vec<u8> = (0..total)
+            .map(|i| (i.wrapping_mul(7).wrapping_add(3)) as u8)
+            .collect();
 
         let dir = crate::storage::test_dir();
         let pa = dir.join("pe_ew_a.img");

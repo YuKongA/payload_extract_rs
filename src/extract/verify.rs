@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use crate::proto::PartitionUpdate;
 use crate::storage::ReadOnlyFile;
 
-use super::verify_update::{FecBuffers, fec_layout, tree_layout};
 use super::verify_update::SHA256_DIGEST_SIZE;
+use super::verify_update::{FecBuffers, fec_layout, tree_layout};
 
 /// Verify SHA256 hash of data against expected hash.
 /// Returns Ok(()) if hashes match or if expected is None.
@@ -104,8 +104,13 @@ pub fn verify_fec(
     let mut buffers = FecBuffers::new(&layout)?;
     let chunk_size = buffers.parity.len() as u64;
     for round in 0..layout.rounds {
-        buffers.encode(&layout, round, |buf, offset| file.read_exact_at(buf, offset))?;
-        let stored = file.read_range(layout.parity.start + round * chunk_size, buffers.parity.len())?;
+        buffers.encode(&layout, round, |buf, offset| {
+            file.read_exact_at(buf, offset)
+        })?;
+        let stored = file.read_range(
+            layout.parity.start + round * chunk_size,
+            buffers.parity.len(),
+        )?;
         if stored != buffers.parity.as_slice() {
             return Ok(false);
         }
@@ -117,7 +122,9 @@ pub fn verify_fec(
 mod tests {
     use super::*;
     use crate::extract::fec::RsEncoder;
-    use crate::extract::verify_update::{compute_and_write_fec, compute_and_write_hash_tree, verify_update_partitions};
+    use crate::extract::verify_update::{
+        compute_and_write_fec, compute_and_write_hash_tree, verify_update_partitions,
+    };
     use crate::proto::Extent;
     use crate::storage::{read_exact_at, write_all_at};
     use std::collections::HashMap;
@@ -134,11 +141,20 @@ mod tests {
         fn new(size: u64) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             loop {
-                let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
                 let path = crate::storage::test_dir().join(format!(
-                    "payload-verify-{stamp}-{}.img", NEXT.fetch_add(1, Ordering::Relaxed),
+                    "payload-verify-{stamp}-{}.img",
+                    NEXT.fetch_add(1, Ordering::Relaxed),
                 ));
-                match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
                     Ok(file) => {
                         file.set_len(size).unwrap();
                         return Self { path, file };
@@ -163,7 +179,10 @@ mod tests {
     }
 
     fn extent(start: u64, blocks: u64) -> Option<Extent> {
-        Some(Extent { start_block: Some(start), num_blocks: Some(blocks) })
+        Some(Extent {
+            start_block: Some(start),
+            num_blocks: Some(blocks),
+        })
     }
 
     #[test]
@@ -203,7 +222,9 @@ mod tests {
             let root = hashes.len() == BS;
             reference_levels.push(hashes.clone());
             source = hashes;
-            if root { break; }
+            if root {
+                break;
+            }
         }
         let reference: Vec<u8> = reference_levels.into_iter().rev().flatten().collect();
         assert!(compute_and_write_hash_tree(&partition, &image.path, BS as u32).unwrap());
@@ -237,7 +258,12 @@ mod tests {
         // Deterministic input, constant within each block, permits an independent
         // column-wise oracle without using the generation layout/round helper.
         for block in 0..254 {
-            write_all_at(&image.file, &vec![(block * 29 + 11) as u8; BS], (block * BS) as u64).unwrap();
+            write_all_at(
+                &image.file,
+                &vec![(block * 29 + 11) as u8; BS],
+                (block * BS) as u64,
+            )
+            .unwrap();
         }
         assert!(compute_and_write_fec(&partition, &image.path, BS as u32).unwrap());
         let encoder = RsEncoder::new(2);
@@ -245,7 +271,9 @@ mod tests {
             let mut symbols = [0u8; 253];
             for (symbol, value) in symbols.iter_mut().enumerate() {
                 let block = symbol * 2 + round;
-                if block < 254 { *value = (block * 29 + 11) as u8; }
+                if block < 254 {
+                    *value = (block * 29 + 11) as u8;
+                }
             }
             let mut parity = [0u8; 2];
             encoder.encode(&symbols, &mut parity);
@@ -276,7 +304,8 @@ mod tests {
             ..Default::default()
         };
         let paths = HashMap::from([(partition.partition_name.clone(), image.path.clone())]);
-        verify_update_partitions(&[&partition], &image.path, BS as u32, 1, Some(&paths), true).unwrap();
+        verify_update_partitions(&[&partition], &image.path, BS as u32, 1, Some(&paths), true)
+            .unwrap();
         assert!(verify_fec(&image.read_only(), &partition, BS as u32).unwrap());
     }
 
