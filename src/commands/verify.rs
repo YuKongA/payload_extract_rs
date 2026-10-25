@@ -33,51 +33,66 @@ pub struct VerifyArgs {
     pub fec: bool,
 }
 
-fn verify_one<'a>(
-    partition: &'a PartitionUpdate,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Verified,
+    Failed,
+    Missing,
+    Unsupported,
+}
+
+fn verify_one(
+    partition: &PartitionUpdate,
     dir: &Path,
     block_size: u32,
     hash_tree: bool,
     fec: bool,
-) -> Option<(&'a str, bool)> {
+) -> Outcome {
     let name = partition.partition_name.as_str();
-    let info = partition.new_partition_info.as_ref()?;
-    let hash = info.hash.as_ref()?;
-    let size = info.size?;
+    let Some(info) = partition.new_partition_info.as_ref() else {
+        style::print_skip(name, "no partition info");
+        return Outcome::Unsupported;
+    };
+    let (Some(hash), Some(size)) = (info.hash.as_ref(), info.size) else {
+        style::print_skip(name, "no partition hash");
+        return Outcome::Unsupported;
+    };
     let path = dir.join(format!("{name}.img"));
     if !path.exists() {
         style::print_skip(name, "file not found");
-        return Some((name, false));
+        return Outcome::Missing;
     }
     // All checks share one read-only file mapping.
     let file = match ReadOnlyFile::open(&path) {
         Ok(file) => file,
         Err(e) => {
             style::print_err(name, format_args!("open: {e}"));
-            return Some((name, false));
+            return Outcome::Failed;
         }
     };
     match verify_partition_file(&file, hash, size) {
         Ok(true) => style::print_ok(name, ""),
         Ok(false) => {
             style::print_fail(name, "SHA256 mismatch");
-            return Some((name, false));
+            return Outcome::Failed;
         }
         Err(e) => {
             style::print_err(name, e);
-            return Some((name, false));
+            return Outcome::Failed;
         }
     }
-    if hash_tree && (partition.hash_tree_extent.is_some() || partition.hash_tree_data_extent.is_some()) {
+    if hash_tree
+        && (partition.hash_tree_extent.is_some() || partition.hash_tree_data_extent.is_some())
+    {
         match verify_hash_tree(&file, partition, block_size) {
             Ok(true) => style::print_ok(name, "hash tree"),
             Ok(false) => {
                 style::print_fail(name, "hash tree mismatch");
-                return Some((name, false));
+                return Outcome::Failed;
             }
             Err(e) => {
                 style::print_err(name, format_args!("hash tree: {e}"));
-                return Some((name, false));
+                return Outcome::Failed;
             }
         }
     }
@@ -86,21 +101,72 @@ fn verify_one<'a>(
             Ok(true) => style::print_ok(name, "FEC"),
             Ok(false) => {
                 style::print_fail(name, "FEC check failed");
-                return Some((name, false));
+                return Outcome::Failed;
             }
             Err(e) => {
                 style::print_err(name, format_args!("FEC: {e}"));
-                return Some((name, false));
+                return Outcome::Failed;
             }
         }
     }
-    Some((name, true))
+    Outcome::Verified
+}
+
+#[derive(Default)]
+struct Summary {
+    verified: usize,
+    failed: usize,
+    missing: usize,
+    unsupported: usize,
+}
+
+impl Summary {
+    /// Partitions with an image on disk.
+    fn checked(&self) -> usize {
+        self.verified + self.failed
+    }
+}
+
+fn summarize(outcomes: &[Outcome]) -> Summary {
+    let mut summary = Summary::default();
+    for outcome in outcomes {
+        match outcome {
+            Outcome::Verified => summary.verified += 1,
+            Outcome::Failed => summary.failed += 1,
+            Outcome::Missing => summary.missing += 1,
+            Outcome::Unsupported => summary.unsupported += 1,
+        }
+    }
+    summary
+}
+
+/// Missing images only fail when the partition was named explicitly; a directory
+/// with nothing to verify always fails.
+fn validate(summary: &Summary, explicit: bool, dir: &Path) -> Result<()> {
+    if summary.failed > 0 {
+        anyhow::bail!("verification failed for {} partition(s)", summary.failed);
+    }
+    if explicit && summary.missing > 0 {
+        anyhow::bail!(
+            "missing images for {} partition(s) in '{}'",
+            summary.missing,
+            dir.display()
+        );
+    }
+    if summary.verified == 0 {
+        anyhow::bail!("no partition images found in '{}'", dir.display());
+    }
+    Ok(())
 }
 
 pub fn run(args: VerifyArgs, insecure: bool, user_agent: Option<&str>) -> Result<()> {
     let start = Instant::now();
     let payload = input::open(&args.input, insecure, user_agent)?;
     let block_size = payload.block_size();
+    let explicit = args
+        .partitions
+        .as_ref()
+        .is_some_and(|names| !names.is_empty());
     let partition_names = args.partitions.unwrap_or_default();
     let partitions = payload.selected_partitions(&partition_names);
     println!(
@@ -108,19 +174,58 @@ pub fn run(args: VerifyArgs, insecure: bool, user_agent: Option<&str>) -> Result
         style::label().apply_to("Verifying"),
         partitions.len()
     );
-    let results: Vec<(&str, bool)> = partitions.par_iter()
-        .filter_map(|p| verify_one(p, &args.dir, block_size, args.hash_tree, args.fec))
+    let outcomes: Vec<Outcome> = partitions
+        .par_iter()
+        .map(|p| verify_one(p, &args.dir, block_size, args.hash_tree, args.fec))
         .collect();
-    let passed = results.iter().filter(|(_, ok)| *ok).count();
-    let total = results.len();
+    let summary = summarize(&outcomes);
+    let mut label = format!(
+        "{}/{} partitions verified",
+        summary.verified,
+        summary.checked()
+    );
+    if summary.missing > 0 {
+        label.push_str(&format!(", {} missing", summary.missing));
+    }
+    if summary.unsupported > 0 {
+        label.push_str(&format!(", {} unsupported", summary.unsupported));
+    }
     let elapsed = start.elapsed();
     println!(
         "\n{} {}",
-        style::success().apply_to(format!("{passed}/{total} partitions verified in")),
+        style::success().apply_to(format!("{label} in")),
         style::success().bold().apply_to(format!("{elapsed:.2?}"))
     );
-    if passed != total {
-        anyhow::bail!("verification failed for {} partition(s)", total - passed);
+    validate(&summary, explicit, &args.dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_images_pass_when_nothing_was_named() {
+        let summary = summarize(&[Outcome::Verified, Outcome::Missing]);
+        assert!(validate(&summary, false, Path::new("out")).is_ok());
     }
-    Ok(())
+
+    #[test]
+    fn missing_images_fail_when_named() {
+        let summary = summarize(&[Outcome::Verified, Outcome::Missing]);
+        let err = validate(&summary, true, Path::new("out")).unwrap_err();
+        assert_eq!(err.to_string(), "missing images for 1 partition(s) in 'out'");
+    }
+
+    #[test]
+    fn failed_checks_fail() {
+        let summary = summarize(&[Outcome::Verified, Outcome::Failed]);
+        assert!(validate(&summary, false, Path::new("out")).is_err());
+    }
+
+    #[test]
+    fn empty_directory_fails() {
+        let summary = summarize(&[Outcome::Missing, Outcome::Unsupported]);
+        let err = validate(&summary, false, Path::new("out")).unwrap_err();
+        assert!(err.to_string().starts_with("no partition images found"));
+    }
 }
