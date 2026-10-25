@@ -20,7 +20,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{} {e}", style::error().apply_to("Error:"));
+        eprintln!("{} {e:#}", style::error().apply_to("Error:"));
         std::process::exit(1);
     }
 }
