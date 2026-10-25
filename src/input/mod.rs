@@ -14,6 +14,7 @@ use memmap2::Mmap;
 
 use crate::ota_metadata::OtaMetadataData;
 use crate::payload::PayloadView;
+use crate::proto::PartitionUpdate;
 
 pub(crate) const ZIP_MAGIC: &[u8; 4] = &[0x50, 0x4B, 0x03, 0x04];
 
@@ -46,10 +47,41 @@ pub fn open(input: &str, insecure: bool, user_agent: Option<&str>) -> Result<Pay
     open_local_file(input)
 }
 
-/// Open with default options; an empty partition list selects all partitions.
+/// Partition selection, resolved against the manifest once it is available.
+#[derive(Clone, Debug, Default)]
+pub enum PartitionFilter {
+    #[default]
+    All,
+    Include(Vec<String>),
+    Exclude(Vec<String>),
+}
+
+impl PartitionFilter {
+    /// Partitions matching this filter; an explicit filter matching nothing is an error.
+    pub fn select<'a>(&self, partitions: &'a [PartitionUpdate]) -> Result<Vec<&'a PartitionUpdate>> {
+        let selected: Vec<&PartitionUpdate> = partitions
+            .iter()
+            .filter(|partition| match self {
+                Self::All => true,
+                Self::Include(names) => names.iter().any(|n| n == &partition.partition_name),
+                Self::Exclude(names) => !names.iter().any(|n| n == &partition.partition_name),
+            })
+            .collect();
+        if selected.is_empty() {
+            match self {
+                Self::All => bail!("payload has no partitions"),
+                Self::Include(_) => bail!("none of the specified partitions found"),
+                Self::Exclude(_) => bail!("all partitions excluded"),
+            }
+        }
+        Ok(selected)
+    }
+}
+
+/// Open with default options.
 pub fn open_for_extract(
     input: &str,
-    partition_names: &[String],
+    filter: &PartitionFilter,
     insecure: bool,
     user_agent: Option<&str>,
 ) -> Result<PayloadView> {
@@ -58,21 +90,21 @@ pub fn open_for_extract(
         user_agent: user_agent.map(str::to_owned),
         ..Default::default()
     };
-    open_for_extract_with(input, partition_names, &opts)
+    open_for_extract_with(input, filter, &opts)
 }
 
-/// Open with explicit options; an empty partition list selects all partitions.
+/// Open with explicit options; `filter` decides which operations are downloaded.
 pub fn open_for_extract_with(
     input: &str,
-    partition_names: &[String],
+    filter: &PartitionFilter,
     opts: &OpenOptions,
 ) -> Result<PayloadView> {
     #[cfg(feature = "http")]
     if input.starts_with("http://") || input.starts_with("https://") {
-        return http::open_http_extract(input, partition_names, opts);
+        return http::open_http_extract(input, filter, opts);
     }
 
-    let _ = (partition_names, opts);
+    let _ = (filter, opts);
     open_local_file(input)
 }
 
@@ -112,5 +144,56 @@ fn open_local_file(input: &str) -> Result<PayloadView> {
         zip_input::open_zip(mmap).context("failed to open ZIP payload")
     } else {
         local::open_local(mmap).context("failed to open raw payload")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partitions(names: &[&str]) -> Vec<PartitionUpdate> {
+        names
+            .iter()
+            .map(|name| PartitionUpdate {
+                partition_name: (*name).to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn names<'a>(selected: &[&'a PartitionUpdate]) -> Vec<&'a str> {
+        selected.iter().map(|p| p.partition_name.as_str()).collect()
+    }
+
+    #[test]
+    fn all_selects_every_partition() {
+        let all = partitions(&["boot", "system"]);
+        let selected = PartitionFilter::All.select(&all).unwrap();
+        assert_eq!(names(&selected), ["boot", "system"]);
+    }
+
+    #[test]
+    fn include_keeps_named_partitions_in_manifest_order() {
+        let all = partitions(&["boot", "system", "vendor"]);
+        let filter = PartitionFilter::Include(vec!["vendor".into(), "boot".into()]);
+        let selected = filter.select(&all).unwrap();
+        assert_eq!(names(&selected), ["boot", "vendor"]);
+    }
+
+    #[test]
+    fn exclude_drops_named_partitions() {
+        let all = partitions(&["boot", "system", "vendor"]);
+        let filter = PartitionFilter::Exclude(vec!["system".into()]);
+        let selected = filter.select(&all).unwrap();
+        assert_eq!(names(&selected), ["boot", "vendor"]);
+    }
+
+    #[test]
+    fn filters_matching_nothing_are_errors() {
+        let all = partitions(&["boot"]);
+        let missing = PartitionFilter::Include(vec!["nope".into()]);
+        assert!(missing.select(&all).is_err());
+        let empty = PartitionFilter::Exclude(vec!["boot".into()]);
+        assert!(empty.select(&all).is_err());
     }
 }

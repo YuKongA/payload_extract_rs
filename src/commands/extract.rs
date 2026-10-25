@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 
 use crate::extract::{self, ExtractConfig};
-use crate::input;
+use crate::input::{self, PartitionFilter};
 use crate::style;
 
 #[derive(Args)]
@@ -62,12 +62,12 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         None
     };
 
-    // For HTTP URLs, we need to know partition names BEFORE opening
-    // so we can do selective range downloads
-    let pre_partition_names: Vec<String> = match (&args.partitions, &args.exclude) {
-        (Some(inc), _) => inc.clone(),
-        // For exclude mode or all, pass empty (handled after manifest parse)
-        _ => Vec::new(),
+    // The filter resolves against the manifest, so HTTP range planning knows
+    // which operations to fetch even in exclude mode.
+    let filter = match (&args.partitions, &args.exclude) {
+        (Some(include), _) => PartitionFilter::Include(include.clone()),
+        (None, Some(exclude)) => PartitionFilter::Exclude(exclude.clone()),
+        (None, None) => PartitionFilter::All,
     };
 
     if !args.quiet {
@@ -82,7 +82,7 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         download_progress: None,
         temp_dir: Some(args.output.clone()),
     };
-    let payload = input::open_for_extract_with(&args.input, &pre_partition_names, &open_opts)?;
+    let payload = input::open_for_extract_with(&args.input, &filter, &open_opts)?;
 
     if !args.quiet {
         let partitions = payload.partitions();
@@ -97,12 +97,11 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         );
     }
 
-    // Build final partition name list with include/exclude logic
-    let partition_names = build_partition_list(
-        &payload,
-        args.partitions.as_deref(),
-        args.exclude.as_deref(),
-    );
+    let partition_names: Vec<String> = filter
+        .select(payload.partitions())?
+        .iter()
+        .map(|p| p.partition_name.clone())
+        .collect();
 
     let config = ExtractConfig {
         verify_ops: args.verify,
@@ -159,25 +158,6 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
     }
 
     Ok(())
-}
-
-/// Build partition name list with include/exclude filtering.
-fn build_partition_list(
-    payload: &crate::payload::PayloadView,
-    include: Option<&[String]>,
-    exclude: Option<&[String]>,
-) -> Vec<String> {
-    match (include, exclude) {
-        (Some(inc), _) => inc.to_vec(),
-        (None, Some(exc)) => payload
-            .partitions()
-            .iter()
-            .map(|p| &p.partition_name)
-            .filter(|name| !exc.iter().any(|e| e == *name))
-            .cloned()
-            .collect(),
-        (None, None) => Vec::new(), // empty = all
-    }
 }
 
 /// Parse output config file. Each line: `partition_name:/path/to/output`

@@ -200,7 +200,7 @@ pub fn open_http_metadata(
 
 pub fn open_http_extract(
     url: &str,
-    partition_names: &[String],
+    filter: &super::PartitionFilter,
     opts: &super::OpenOptions,
 ) -> Result<PayloadView> {
     use std::sync::Arc;
@@ -229,18 +229,7 @@ pub fn open_http_extract(
         )?;
         let data_offset = meta_len;
 
-        let parts: Vec<_> = if partition_names.is_empty() {
-            manifest.partitions.iter().collect()
-        } else {
-            manifest
-                .partitions
-                .iter()
-                .filter(|p| partition_names.iter().any(|n| n == &p.partition_name))
-                .collect()
-        };
-        if parts.is_empty() && !partition_names.is_empty() {
-            bail!("none of the specified partitions found");
-        }
+        let parts = filter.select(&manifest.partitions)?;
 
         let mut op_ranges: Vec<(u64, u64)> = Vec::new();
         for p in &parts {
