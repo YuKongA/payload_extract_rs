@@ -19,7 +19,7 @@ pub struct ExtractArgs {
     pub output: PathBuf,
 
     /// Comma-separated partition names to include (empty = all)
-    #[arg(short, long, value_delimiter = ',')]
+    #[arg(short, long, value_delimiter = ',', conflicts_with = "exclude")]
     pub partitions: Option<Vec<String>>,
 
     /// Comma-separated partition names to exclude

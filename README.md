@@ -48,7 +48,7 @@ payload-extract extract ota.zip -p init_boot
 # Extract from HTTP URL (downloads only needed data)
 payload-extract extract "https://example.com/ota.zip" -p init_boot
 
-# Exclude specific partitions
+# Exclude specific partitions (-p and -x are mutually exclusive)
 payload-extract extract payload.bin -x system,vendor,product
 
 # With SHA256 verification
@@ -171,7 +171,7 @@ payload-extract extract ota.zip -p init_boot
 # 从 HTTP URL 提取（仅下载所需数据）
 payload-extract extract "https://example.com/ota.zip" -p init_boot
 
-# 排除指定分区
+# 排除指定分区（-p 与 -x 互斥）
 payload-extract extract payload.bin -x system,vendor,product
 
 # 启用 SHA256 校验
