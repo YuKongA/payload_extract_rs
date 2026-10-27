@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use prost::Message;
 
 use crate::ota_metadata::{self, OtaMetadataData};
@@ -264,33 +265,52 @@ pub fn open_http_extract(
 
         let total_size = plan.total_size;
 
-        // Create the temp file in the requested directory (default: system temp).
-        // create_dir_all because the output dir may not exist yet at open time.
-        let temp_dir = opts
-            .temp_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
-        std::fs::create_dir_all(&temp_dir)
-            .with_context(|| format!("failed to create temp dir '{}'", temp_dir.display()))?;
-        let named = tempfile::NamedTempFile::new_in(&temp_dir)
-            .context("failed to create temp payload file")?;
-        named
-            .as_file()
-            .set_len(total_size)
-            .context("failed to size temp payload file")?;
+        let in_memory_limit: u64 = if cfg!(target_pointer_width = "64") {
+            1024 * 1024 * 1024
+        } else {
+            128 * 1024 * 1024
+        };
+        let in_memory = if total_size <= in_memory_limit {
+            if let Some(available) = available_memory() {
+                available >= total_size.saturating_add(256 * 1024 * 1024)
+            } else {
+                true
+            }
+        } else {
+            false
+        };
 
-        // Write metadata at the front, then stream each range into its region.
-        write_all_at(named.as_file(), &meta, 0).context("temp file write failed")?;
-        drop(meta);
-
-        // Cloned handle shared across the concurrent downloaders; positional
-        // writes target disjoint regions so no lock is needed.
-        let write_file = Arc::new(
+        let (mem_buf, target, named_file) = if in_memory {
+            let mut buf = vec![0u8; total_size as usize];
+            buf[..meta.len()].copy_from_slice(&meta);
+            let target = DownloadTarget::Buffer(SyncBuffer {
+                ptr: buf.as_mut_ptr(),
+                len: buf.len(),
+            });
+            (Some(buf), target, None)
+        } else {
+            let temp_dir = opts
+                .temp_dir
+                .clone()
+                .unwrap_or_else(std::env::temp_dir);
+            std::fs::create_dir_all(&temp_dir)
+                .with_context(|| format!("failed to create temp dir '{}'", temp_dir.display()))?;
+            let named = tempfile::NamedTempFile::new_in(&temp_dir)
+                .context("failed to create temp payload file")?;
             named
                 .as_file()
-                .try_clone()
-                .context("failed to clone temp file handle")?,
-        );
+                .set_len(total_size)
+                .context("failed to size temp payload file")?;
+            write_all_at(named.as_file(), &meta, 0).context("temp file write failed")?;
+            let file_ref = Arc::new(
+                named
+                    .as_file()
+                    .try_clone()
+                    .context("failed to clone temp file handle")?,
+            );
+            (None, DownloadTarget::File(file_ref), Some(named))
+        };
+        drop(meta);
 
         let client = Arc::new(client);
         let url: Arc<str> = Arc::from(url);
@@ -316,16 +336,16 @@ pub fn open_http_extract(
                 let url = url.clone();
                 let downloaded = downloaded.clone();
                 let sem = sem.clone();
-                let write_file = write_file.clone();
+                let target = target.clone();
 
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    range_download_to_file(
+                    range_download_to_target(
                         &client,
                         &url,
                         remote_off,
                         chunk_len,
-                        &write_file,
+                        &target,
                         chunk_file_base,
                         &downloaded,
                     )
@@ -373,34 +393,130 @@ pub fn open_http_extract(
             cb(total_data, total_data);
         }
 
-        // Done writing; drop the writer handle and mmap the temp file read-only.
-        drop(write_file);
-        style::log(
-            "Temp file",
-            format_args!(
-                "{} (meta {} + data {})",
-                style::format_size(total_size),
-                style::format_size(meta_len),
-                style::format_size(total_data),
-            ),
-        );
-
-        let mmap = unsafe { memmap2::Mmap::map(named.as_file()) }
-            .context("failed to mmap temp payload file")?;
-        Ok(PayloadView::from_mmap_compact(mmap, plan.remap, Box::new(named))?)
+        drop(target);
+        if let Some(buf) = mem_buf {
+            style::log(
+                "In-memory",
+                format_args!(
+                    "{} (meta {} + data {})",
+                    style::format_size(total_size),
+                    style::format_size(meta_len),
+                    style::format_size(total_data),
+                ),
+            );
+            Ok(PayloadView::from_memory(buf, plan.remap)?)
+        } else {
+            let named = named_file.unwrap();
+            style::log(
+                "Temp file",
+                format_args!(
+                    "{} (meta {} + data {})",
+                    style::format_size(total_size),
+                    style::format_size(meta_len),
+                    style::format_size(total_data),
+                ),
+            );
+            let mmap = unsafe { memmap2::Mmap::map(named.as_file()) }
+                .context("failed to mmap temp payload file")?;
+            Ok(PayloadView::from_mmap_compact(mmap, plan.remap, Box::new(named))?)
+        }
     })
 }
 
-/// Download a byte range and stream it straight to `file` at `file_base` via
-/// positional writes — never buffering the whole range in memory. Increments
-/// `downloaded` per chunk for progress. Mirrors [`range_download`]'s retry and
-/// HTTP-200-fallback behavior.
-async fn range_download_to_file(
+/// Download a byte range and stream it to `target` (memory buffer or disk file)
+/// at positional offsets. Increments `downloaded` per chunk for progress.
+/// Mirrors [`range_download`]'s retry and HTTP-200-fallback behavior.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn available_memory() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn available_memory() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(stat: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut stat = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    if unsafe { GlobalMemoryStatusEx(&mut stat) } != 0 {
+        Some(stat.avail_phys)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+fn available_memory() -> Option<u64> {
+    None
+}
+
+#[derive(Clone, Copy)]
+struct SyncBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+unsafe impl Send for SyncBuffer {}
+unsafe impl Sync for SyncBuffer {}
+
+#[derive(Clone)]
+enum DownloadTarget {
+    File(Arc<std::fs::File>),
+    Buffer(SyncBuffer),
+}
+
+impl DownloadTarget {
+    fn write_at(&self, data: &[u8], offset: u64) -> Result<()> {
+        match self {
+            Self::File(file) => write_all_at(file, data, offset).context("temp file write failed"),
+            Self::Buffer(buf) => {
+                let off = usize::try_from(offset).context("offset overflow")?;
+                let end = off.checked_add(data.len()).context("buffer overflow")?;
+                ensure!(end <= buf.len, "buffer write out of bounds");
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr.add(off), data.len());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+async fn range_download_to_target(
     client: &reqwest::Client,
     url: &str,
     offset: u64,
     length: u64,
-    file: &std::fs::File,
+    target: &DownloadTarget,
     file_base: u64,
     downloaded: &AtomicU64,
 ) -> Result<()> {
@@ -430,8 +546,7 @@ async fn range_download_to_file(
             let mut written = 0u64;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("stream error")?;
-                write_all_at(file, &chunk, file_base + written)
-                    .context("temp file write failed")?;
+                target.write_at(&chunk, file_base + written)?;
                 written += chunk.len() as u64;
                 downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
@@ -464,8 +579,7 @@ async fn range_download_to_file(
                             continue;
                         }
                         let take = (chunk.len() as u64).min(remaining) as usize;
-                        write_all_at(file, &chunk[..take], file_base + written)
-                            .context("temp file write failed")?;
+                        target.write_at(&chunk[..take], file_base + written)?;
                         written += take as u64;
                         remaining -= take as u64;
                         downloaded.fetch_add(take as u64, Ordering::Relaxed);
@@ -722,4 +836,16 @@ fn resolve_zip64_fields(
         p += 4 + sz;
     }
     (local_off, csize, usize_)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_available_memory() {
+        if let Some(avail) = available_memory() {
+            assert!(avail > 0);
+        }
+    }
 }
