@@ -262,13 +262,7 @@ fn extract_selected(
         Ok(())
     };
 
-    let thread_count = if config.threads == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    } else {
-        config.threads
-    };
+    let thread_count = resolve_thread_count(config.threads);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build()
@@ -367,6 +361,16 @@ fn process_operation(
     }
 
     Ok(())
+}
+
+pub fn resolve_thread_count(requested: usize) -> usize {
+    if requested != 0 {
+        requested
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    }
 }
 
 /// Borrow operation bytes directly from the payload mapping.
@@ -691,5 +695,16 @@ mod stream_tests {
             }
             assert_eq!(out, data, "codec {ot:?} roundtrip mismatch");
         }
+    }
+
+    #[test]
+    fn test_resolve_thread_count() {
+        assert_eq!(super::resolve_thread_count(4), 4);
+        assert_eq!(super::resolve_thread_count(1), 1);
+        let default_count = super::resolve_thread_count(0);
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(default_count, available);
     }
 }
