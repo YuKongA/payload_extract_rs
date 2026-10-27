@@ -38,6 +38,9 @@ pub struct ExtractArgs {
     #[arg(short = 'j', long, default_value = "0")]
     pub threads: usize,
 
+    /// Maximum concurrent HTTP download connections (default: 4)
+    #[arg(short = 'c', long, value_name = "NUM")]
+    pub concurrency: Option<usize>,
     /// Verify SHA256 hash of each operation's data
     #[arg(short, long)]
     pub verify: bool,
@@ -81,6 +84,7 @@ pub fn run(args: ExtractArgs, insecure: bool, user_agent: Option<&str>) -> Resul
         user_agent: user_agent.map(str::to_owned),
         download_progress: None,
         temp_dir: Some(args.output.clone()),
+        concurrency: args.concurrency,
     };
     let payload = input::open_for_extract_with(&args.input, &filter, &open_opts)?;
 

@@ -17,12 +17,18 @@ use super::ranges::plan_compact;
 const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
 const ZIP_CD_SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
 const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
+const MAX_DOWNLOAD_CHUNK: u64 = 32 * 1024 * 1024;
+const DEFAULT_CONCURRENCY: usize = 4;
 
 /// Default User-Agent
 const DEFAULT_USER_AGENT: &str =
     "Dalvik/2.1.0 (Linux; V; Android 16; Android Build/BP2A.250605.015)";
 
-fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Client> {
+fn build_client(
+    insecure: bool,
+    user_agent: Option<&str>,
+    max_concurrency: usize,
+) -> Result<reqwest::Client> {
     let mut default_headers = reqwest::header::HeaderMap::new();
     default_headers.insert(
         reqwest::header::ACCEPT_ENCODING,
@@ -36,7 +42,8 @@ fn build_client(insecure: bool, user_agent: Option<&str>) -> Result<reqwest::Cli
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(max_concurrency.max(4))
+        .tcp_nodelay(true)
         .redirect(reqwest::redirect::Policy::limited(10));
 
     #[cfg(feature = "http-rustls")]
@@ -177,7 +184,7 @@ pub fn open_http_metadata(
 ) -> Result<PayloadView> {
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(insecure, user_agent)?;
+        let client = build_client(insecure, user_agent, DEFAULT_CONCURRENCY)?;
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
@@ -208,7 +215,8 @@ pub fn open_http_extract(
 
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(opts.insecure, opts.user_agent.as_deref())?;
+        let concurrency = opts.concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1);
+        let client = build_client(opts.insecure, opts.user_agent.as_deref(), concurrency)?;
         let payload_off = detect_payload_offset(&client, url).await?;
 
         eprintln!("{}...", style::label().apply_to("Fetching payload header"));
@@ -287,34 +295,43 @@ pub fn open_http_extract(
         let client = Arc::new(client);
         let url: Arc<str> = Arc::from(url);
         let downloaded = Arc::new(AtomicU64::new(0));
-        let sem = Arc::new(tokio::sync::Semaphore::new(8));
-
-        let mut handles = Vec::with_capacity(plan.ranges.len());
+        let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut handles = Vec::new();
         for range in &plan.ranges {
-            let client = client.clone();
-            let url = url.clone();
-            let downloaded = downloaded.clone();
-            let sem = sem.clone();
-            let write_file = write_file.clone();
-            let remote_off = payload_off.checked_add(data_offset)
+            let remote_off_base = payload_off
+                .checked_add(data_offset)
                 .and_then(|offset| offset.checked_add(range.data_offset))
                 .context("remote operation offset overflows")?;
             let file_base = range.file_offset;
-            let length = range.length;
+            let total_len = range.length;
 
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                range_download_to_file(
-                    &client,
-                    &url,
-                    remote_off,
-                    length,
-                    &write_file,
-                    file_base,
-                    &downloaded,
-                )
-                .await
-            }));
+            let mut offset_in_range = 0u64;
+            while offset_in_range < total_len {
+                let chunk_len = (total_len - offset_in_range).min(MAX_DOWNLOAD_CHUNK);
+                let remote_off = remote_off_base + offset_in_range;
+                let chunk_file_base = file_base + offset_in_range;
+                offset_in_range += chunk_len;
+
+                let client = client.clone();
+                let url = url.clone();
+                let downloaded = downloaded.clone();
+                let sem = sem.clone();
+                let write_file = write_file.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    range_download_to_file(
+                        &client,
+                        &url,
+                        remote_off,
+                        chunk_len,
+                        &write_file,
+                        chunk_file_base,
+                        &downloaded,
+                    )
+                    .await
+                }));
+            }
         }
 
         let pb = indicatif::ProgressBar::new(total_data);
@@ -480,7 +497,7 @@ pub fn read_ota_metadata_http(
 ) -> Result<OtaMetadataData> {
     let rt = build_runtime()?;
     rt.block_on(async {
-        let client = build_client(insecure, user_agent)?;
+        let client = build_client(insecure, user_agent, DEFAULT_CONCURRENCY)?;
         let (total_size, head) = fetch_total_size_and_head(&client, url).await?;
         if head.len() < 4 || &head[..4] != ZIP_MAGIC {
             bail!(

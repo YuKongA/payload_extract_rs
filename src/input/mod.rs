@@ -33,6 +33,7 @@ pub struct OpenOptions {
     pub download_progress: Option<ProgressCallback>,
     /// HTTP cache directory (default: system temp); use output on Android to avoid tmpfs.
     pub temp_dir: Option<PathBuf>,
+    pub concurrency: Option<usize>,
 }
 
 /// Open a payload from a file path or URL and return a PayloadView.

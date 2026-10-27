@@ -77,14 +77,8 @@ http-native-tls = ["http", "reqwest?/native-tls"]
 http-rustls = ["http", "dep:webpki-root-certs", "dep:rustls", "reqwest?/rustls-no-provider"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
-
-[profile.release.package.sha2]
-opt-level = 3
-
-[profile.release.package.lz4_flex]
-opt-level = 3
