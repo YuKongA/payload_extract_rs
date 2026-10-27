@@ -35,10 +35,23 @@ struct PayloadMetadata {
 #[derive(Serialize)]
 struct DynPartMeta {
     snapshot_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression_factor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disable_ublk: Option<bool>,
     vabc_enabled: Option<bool>,
     vabc_compression_param: Option<String>,
     cow_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vabc_feature_set: Option<VabcFeatureSet>,
     groups: Vec<DynPartGroup>,
+}
+#[derive(Serialize)]
+struct VabcFeatureSet {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threaded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batch_writes: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -66,9 +79,15 @@ pub fn run(args: MetadataArgs, insecure: bool, user_agent: Option<&str>) -> Resu
         .as_ref()
         .map(|d| DynPartMeta {
             snapshot_enabled: d.snapshot_enabled,
+            compression_factor: d.compression_factor,
+            disable_ublk: d.disable_ublk,
             vabc_enabled: d.vabc_enabled,
             vabc_compression_param: d.vabc_compression_param.clone(),
             cow_version: d.cow_version,
+            vabc_feature_set: d.vabc_feature_set.as_ref().map(|f| VabcFeatureSet {
+                threaded: f.threaded,
+                batch_writes: f.batch_writes,
+            }),
             groups: d
                 .groups
                 .iter()
@@ -168,6 +187,32 @@ pub fn run(args: MetadataArgs, insecure: bool, user_agent: Option<&str>) -> Resu
                     "  {}         {snap}",
                     style::label().apply_to("Snapshot enabled:")
                 );
+            }
+            if let Some(factor) = dyn_meta.compression_factor {
+                println!(
+                    "  {}     {factor}",
+                    style::label().apply_to("Compression factor:")
+                );
+            }
+            if let Some(ublk) = dyn_meta.disable_ublk {
+                println!(
+                    "  {}         {ublk}",
+                    style::label().apply_to("Disable UBLK:")
+                );
+            }
+            if let Some(feat) = &dyn_meta.vabc_feature_set {
+                if let Some(threaded) = feat.threaded {
+                    println!(
+                        "  {}      {threaded}",
+                        style::label().apply_to("VABC threaded:")
+                    );
+                }
+                if let Some(batch) = feat.batch_writes {
+                    println!(
+                        "  {}  {batch}",
+                        style::label().apply_to("VABC batch writes:")
+                    );
+                }
             }
             if let Some(vabc) = dyn_meta.vabc_enabled {
                 println!(

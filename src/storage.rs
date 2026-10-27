@@ -25,6 +25,10 @@ impl ReadOnlyFile {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         buf.copy_from_slice(self.read_range(offset, buf.len())?);
         Ok(())

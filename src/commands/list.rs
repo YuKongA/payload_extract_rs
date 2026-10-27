@@ -17,6 +17,10 @@ pub struct ListArgs {
     /// Show SHA256 hash for each partition
     #[arg(short = 'H', long)]
     pub hash: bool,
+
+    /// Comma-separated partition names to display (empty = all)
+    #[arg(short, long, value_delimiter = ',')]
+    pub partitions: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -34,6 +38,13 @@ pub fn run(args: ListArgs, insecure: bool, user_agent: Option<&str>) -> Result<(
 
     let entries: Vec<PartitionEntry> = partitions
         .iter()
+        .filter(|p| {
+            if let Some(targets) = &args.partitions {
+                targets.iter().any(|t| t == &p.partition_name)
+            } else {
+                true
+            }
+        })
         .map(|p| {
             let info = p.new_partition_info.as_ref();
             let size = info.and_then(|i| i.size).unwrap_or(0);
