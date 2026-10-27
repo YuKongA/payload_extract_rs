@@ -544,15 +544,32 @@ async fn range_download_to_target(
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             let mut stream = resp.bytes_stream();
             let mut written = 0u64;
+            let mut stream_err = None;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("stream error")?;
-                target.write_at(&chunk, file_base + written)?;
-                written += chunk.len() as u64;
-                downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                match chunk {
+                    Ok(chunk) => {
+                        target.write_at(&chunk, file_base + written)?;
+                        written += chunk.len() as u64;
+                        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
             }
-            // A short range would leave zero-filled gaps in the temp file →
-            // corrupt extraction. Fail loudly instead.
+            if let Some(e) = stream_err {
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
+                    continue;
+                }
+                return Err(e).context("stream error");
+            }
             if written != length {
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt))).await;
+                    continue;
+                }
                 bail!("short read: got {written} of {length} bytes for range {offset}-{end}");
             }
             return Ok(());
