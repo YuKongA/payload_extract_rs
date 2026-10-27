@@ -57,6 +57,9 @@ payload-extract extract payload.bin -p boot --verify
 # Control thread count
 payload-extract extract payload.bin -j 4
 
+# Control HTTP download concurrency
+payload-extract extract "https://example.com/ota.zip" -p system -c 8
+
 # Delta/incremental OTA
 payload-extract extract delta_payload.bin --source-dir old_images/
 
@@ -74,8 +77,9 @@ payload-extract extract payload.bin --out-config paths.txt
 
 ```bash
 payload-extract list payload.bin
-payload-extract list payload.bin --hash       # show SHA256
-payload-extract list payload.bin --json       # JSON output
+payload-extract list payload.bin --hash             # show SHA256
+payload-extract list payload.bin -p boot,init_boot  # filter partitions
+payload-extract list payload.bin --json             # JSON output
 payload-extract list "https://example.com/ota.zip"  # from URL
 ```
 
@@ -180,6 +184,9 @@ payload-extract extract payload.bin -p boot --verify
 # 控制线程数
 payload-extract extract payload.bin -j 4
 
+# 控制 HTTP 下载并发连接数
+payload-extract extract "https://example.com/ota.zip" -p system -c 8
+
 # 增量 OTA
 payload-extract extract delta_payload.bin --source-dir old_images/
 
@@ -197,8 +204,9 @@ payload-extract extract payload.bin --out-config paths.txt
 
 ```bash
 payload-extract list payload.bin
-payload-extract list payload.bin --hash       # 显示 SHA256
-payload-extract list payload.bin --json       # JSON 输出
+payload-extract list payload.bin --hash             # 显示 SHA256
+payload-extract list payload.bin -p boot,init_boot  # 仅列出指定分区
+payload-extract list payload.bin --json             # JSON 输出
 payload-extract list "https://example.com/ota.zip"  # 从 URL
 ```
 
