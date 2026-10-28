@@ -21,7 +21,6 @@ const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
 const MAX_DOWNLOAD_CHUNK: u64 = 32 * 1024 * 1024;
 const DEFAULT_CONCURRENCY: usize = 4;
 
-/// Default User-Agent
 const DEFAULT_USER_AGENT: &str =
     "Dalvik/2.1.0 (Linux; V; Android 16; Android Build/BP2A.250605.015)";
 
@@ -68,9 +67,53 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
         .context("failed to create tokio runtime")
 }
 
-/// Download a byte range fully into memory. Used for small reads (header,
-/// manifest, ZIP central directory, LFH). Large selective-download ranges go
-/// through [`range_download_to_file`] instead, which streams to disk.
+/// Require exact bounds; return `None` when the total size is unknown.
+fn validate_content_range(
+    headers: &reqwest::header::HeaderMap,
+    start: u64,
+    end: u64,
+) -> Result<Option<u64>> {
+    let value = headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .context("missing Content-Range header")?
+        .to_str()
+        .context("invalid Content-Range header")?;
+    let (unit, range) = value
+        .split_once(' ')
+        .context("invalid Content-Range header")?;
+    ensure!(
+        unit.eq_ignore_ascii_case("bytes"),
+        "invalid Content-Range unit: {value}"
+    );
+    let (bounds, total) = range
+        .split_once('/')
+        .context("invalid Content-Range header")?;
+    let (first, last) = bounds
+        .split_once('-')
+        .context("invalid Content-Range header")?;
+    let first: u64 = first.parse().context("invalid Content-Range start")?;
+    let last: u64 = last.parse().context("invalid Content-Range end")?;
+    ensure!(
+        first == start && last == end,
+        "unexpected Content-Range {value}; expected bytes {start}-{end}"
+    );
+    if total == "*" {
+        Ok(None)
+    } else {
+        let total: u64 = total.parse().context("invalid Content-Range total")?;
+        ensure!(total > last, "invalid Content-Range total: {value}");
+        Ok(Some(total))
+    }
+}
+
+fn range_end(offset: u64, length: u64) -> Result<u64> {
+    ensure!(length > 0, "zero-length HTTP range");
+    offset
+        .checked_add(length - 1)
+        .context("HTTP range overflows")
+}
+
+/// Buffer small ranges; stream large downloads via [`range_download_to_target`].
 async fn range_download(
     client: &reqwest::Client,
     url: &str,
@@ -79,7 +122,7 @@ async fn range_download(
 ) -> Result<Vec<u8>> {
     use futures::StreamExt;
 
-    let end = offset + length - 1;
+    let end = range_end(offset, length)?;
     for attempt in 0..=3u32 {
         let resp = match client
             .get(url)
@@ -99,18 +142,27 @@ async fn range_download(
 
         let status = resp.status();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            // Stream into a pre-sized buffer (one copy, no realloc), avoiding the
-            // extra full copy that `resp.bytes().to_vec()` would incur.
+            validate_content_range(resp.headers(), offset, end)?;
+            // Stream into the final buffer to avoid a full-body copy.
             let mut buf = Vec::with_capacity(length as usize);
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.context("stream error")?;
+                ensure!(
+                    (chunk.len() as u64) <= length - buf.len() as u64,
+                    "HTTP range response exceeds requested length"
+                );
                 buf.extend_from_slice(&chunk);
             }
+            ensure!(
+                buf.len() as u64 == length,
+                "short HTTP range response: got {} of {length} bytes",
+                buf.len()
+            );
             return Ok(buf);
         }
 
-        if status.is_success() {
+        if status == reqwest::StatusCode::OK {
             // 200 fallback: stream only requested bytes to prevent OOM
             let mut buf = Vec::with_capacity(length as usize);
             let mut stream = resp.bytes_stream();
@@ -140,6 +192,7 @@ async fn range_download(
                     None => break,
                 }
             }
+            ensure!(to_read == 0, "short HTTP response: missing {to_read} of {length} bytes");
             return Ok(buf);
         }
 
@@ -364,9 +417,7 @@ pub fn open_http_extract(
         );
         pb.set_prefix("Downloading");
 
-        // Drive the bar (and the optional caller callback) from the shared byte
-        // counter on a timer so progress advances as bytes stream in — even with
-        // a single merged range, which otherwise sits at 0% then jumps to 100%.
+        // Poll streamed byte counts so progress advances within each range.
         let ticker = {
             let pb = pb.clone();
             let downloaded = downloaded.clone();
@@ -423,9 +474,6 @@ pub fn open_http_extract(
     })
 }
 
-/// Download a byte range and stream it to `target` (memory buffer or disk file)
-/// at positional offsets. Increments `downloaded` per chunk for progress.
-/// Mirrors [`range_download`]'s retry and HTTP-200-fallback behavior.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn available_memory() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -511,6 +559,7 @@ impl DownloadTarget {
     }
 }
 
+/// Stream a range into memory or a file, updating `downloaded` per chunk.
 async fn range_download_to_target(
     client: &reqwest::Client,
     url: &str,
@@ -522,7 +571,7 @@ async fn range_download_to_target(
 ) -> Result<()> {
     use futures::StreamExt;
 
-    let end = offset + length - 1;
+    let end = range_end(offset, length)?;
     for attempt in 0..=3u32 {
         let resp = match client
             .get(url)
@@ -542,12 +591,17 @@ async fn range_download_to_target(
 
         let status = resp.status();
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            validate_content_range(resp.headers(), offset, end)?;
             let mut stream = resp.bytes_stream();
             let mut written = 0u64;
             let mut stream_err = None;
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        ensure!(
+                            (chunk.len() as u64) <= length - written,
+                            "HTTP range response exceeds requested length"
+                        );
                         target.write_at(&chunk, file_base + written)?;
                         written += chunk.len() as u64;
                         downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -575,9 +629,8 @@ async fn range_download_to_target(
             return Ok(());
         }
 
-        if status.is_success() {
+        if status == reqwest::StatusCode::OK {
             // 200 fallback: server ignored Range and returns the whole file.
-            // Skip `offset` bytes, then write exactly `length` bytes to disk.
             let mut stream = resp.bytes_stream();
             let mut to_skip = offset;
             let mut written = 0u64;
@@ -639,8 +692,8 @@ pub fn read_ota_metadata_http(
         let cd = fetch_zip_cd(&client, url, total_size).await?;
 
         let (text_bytes, pb_bytes) = tokio::try_join!(
-            download_stored_zip_entry(&client, url, &cd, ota_metadata::text_entry_name()),
-            download_stored_zip_entry(&client, url, &cd, ota_metadata::pb_entry_name()),
+            download_stored_zip_entry(&client, url, &cd, ota_metadata::text_entry_name(), total_size),
+            download_stored_zip_entry(&client, url, &cd, ota_metadata::pb_entry_name(), total_size),
         )?;
 
         let mut data = OtaMetadataData::default();
@@ -654,8 +707,7 @@ pub fn read_ota_metadata_http(
     })
 }
 
-/// One-shot fetch of bytes 0..=3 that returns both the file's total size (from
-/// Content-Range or Content-Length) and the first four bytes for magic detection.
+/// Probe the file size and magic using a four-byte range request.
 async fn fetch_total_size_and_head(client: &reqwest::Client, url: &str) -> Result<(u64, Vec<u8>)> {
     let resp = client
         .get(url)
@@ -665,18 +717,18 @@ async fn fetch_total_size_and_head(client: &reqwest::Client, url: &str) -> Resul
         .error_for_status()?;
 
     let total_size = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        resp.headers()
-            .get("content-range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.rsplit('/').next())
-            .and_then(|s| s.parse::<u64>().ok())
+        validate_content_range(resp.headers(), 0, 3)?
             .context("cannot determine file size from Content-Range")?
     } else {
         resp.content_length()
             .context("server returned no Content-Length")?
     };
 
+    let partial = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let head = resp.bytes().await?.to_vec();
+    if partial {
+        ensure!(head.len() == 4, "invalid HTTP range response length: expected 4, got {}", head.len());
+    }
     let head = if head.len() >= 4 {
         head
     } else {
@@ -781,6 +833,7 @@ async fn download_stored_zip_entry(
     url: &str,
     cd: &[u8],
     target: &str,
+    total_size: u64,
 ) -> Result<Option<Vec<u8>>> {
     let Some(entry) = find_cd_entry(cd, target) else {
         return Ok(None);
@@ -794,7 +847,10 @@ async fn download_stored_zip_entry(
 
     const LFH_EXTRA_HEADROOM: u64 = 1024;
     let optimistic = 30 + entry.name_len as u64 + LFH_EXTRA_HEADROOM + entry.compressed_size;
-    let buf = range_download(client, url, entry.local_off, optimistic).await?;
+    let available = total_size
+        .checked_sub(entry.local_off)
+        .context("ZIP entry offset exceeds archive length")?;
+    let buf = range_download(client, url, entry.local_off, optimistic.min(available)).await?;
     if buf.len() < 30 {
         bail!("LFH truncated for {target}");
     }
@@ -807,7 +863,6 @@ async fn download_stored_zip_entry(
         return Ok(Some(buf[data_off..data_end].to_vec()));
     }
 
-    // LFH extra exceeded headroom — fall back to a second range request.
     let abs_data_off = entry.local_off + data_off as u64;
     let data = range_download(client, url, abs_data_off, entry.compressed_size).await?;
     Ok(Some(data))
@@ -858,6 +913,83 @@ fn resolve_zip64_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    fn serve_once(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let _ = stream.write_all(response);
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn partial_reads_reject_bad_ranges_and_lengths() {
+        let runtime = build_runtime().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        runtime.block_on(async {
+            for (response, expected) in [
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbcde".as_slice(), true),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-5/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbcde".as_slice(), false),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbcde".as_slice(), false),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nbcdef\r\n0\r\n\r\n".as_slice(), false),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbcd".as_slice(), false),
+                (b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij".as_slice(), true),
+            ] {
+                let (url, server) = serve_once(response);
+                let result = range_download(&client, &url, 1, 4).await;
+                if expected {
+                    assert_eq!(result.unwrap(), b"bcde");
+                } else {
+                    assert!(result.is_err());
+                }
+                server.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn partial_target_write_never_crosses_requested_range() {
+        let runtime = build_runtime().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        runtime.block_on(async {
+            for (response, expected) in [
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbcde".as_slice(), true),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-5/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbcde".as_slice(), false),
+                (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nbcdef\r\n0\r\n\r\n".as_slice(), false),
+            ] {
+                let (url, server) = serve_once(response);
+                let mut bytes = [0xaa; 8];
+                let target = DownloadTarget::Buffer(SyncBuffer {
+                    ptr: bytes.as_mut_ptr(),
+                    len: bytes.len(),
+                });
+                let downloaded = AtomicU64::new(0);
+                let result =
+                    range_download_to_target(&client, &url, 1, 4, &target, 0, &downloaded).await;
+                assert_eq!(result.is_ok(), expected);
+                assert_eq!(&bytes[4..], &[0xaa; 4]);
+                if expected {
+                    assert_eq!(&bytes[..4], b"bcde");
+                }
+                server.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn zip_size_probe_rejects_wrong_content_range() {
+        let runtime = build_runtime().unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (url, server) = serve_once(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1-4/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPKxx");
+        assert!(runtime.block_on(fetch_total_size_and_head(&client, &url)).is_err());
+        server.join().unwrap();
+    }
 
     #[test]
     fn test_available_memory() {
